@@ -18,8 +18,10 @@
   };
 
   let capture = null;
+  let audioReady = false;
   let els = null;
   let timeupdateBound = false;
+  let autoFollow = true; // keep the playing line in view until the user scrolls away
 
   function video() {
     return adapter.getVideo();
@@ -101,6 +103,7 @@
           <button class="ylr-tab" data-tab="saved">Saved</button>
         </div>
         <div class="ylr-head-right">
+          <button class="ylr-audio" title="Audio capture">🎙</button>
           <select class="ylr-lang" title="Subtitle language"></select>
           <button class="ylr-icon ylr-close" title="Hide">✕</button>
         </div>
@@ -108,7 +111,9 @@
       <div class="ylr-body">
         <div class="ylr-list" data-panel="subs"></div>
         <div class="ylr-saved" data-panel="saved" hidden></div>
-      </div>`;
+      </div>
+      <button class="ylr-jump ylr-jump-top" hidden>↑ Now playing</button>
+      <button class="ylr-jump ylr-jump-bottom" hidden>↓ Now playing</button>`;
     document.body.appendChild(root);
 
     const toggle = document.createElement("button");
@@ -126,13 +131,31 @@
       root,
       toggle,
       tip,
+      audio: root.querySelector(".ylr-audio"),
       lang: root.querySelector(".ylr-lang"),
+      body: root.querySelector(".ylr-body"),
       list: root.querySelector('[data-panel="subs"]'),
       saved: root.querySelector('[data-panel="saved"]'),
+      jumpTop: root.querySelector(".ylr-jump-top"),
+      jumpBottom: root.querySelector(".ylr-jump-bottom"),
       tabs: root.querySelectorAll(".ylr-tab")
     };
+    els.jumpTop.addEventListener("click", jumpToActive);
+    els.jumpBottom.addEventListener("click", jumpToActive);
 
-    root.querySelector(".ylr-body").addEventListener("scroll", hideTip);
+    // The mic pill is only meaningful where audio needs enabling (Netflix); the
+    // element tap on YouTube just works on first star.
+    if (adapter.name !== "netflix") els.audio.style.display = "none";
+    els.audio.addEventListener("click", () => {
+      if (!audioReady)
+        alert(
+          "To save audio on Netflix, click this extension's icon in the Chrome " +
+            "toolbar once — that enables tab-audio capture for this tab. Then star a line."
+        );
+    });
+    updateAudioStatus();
+
+    els.body.addEventListener("scroll", onBodyScroll);
 
     els.lang.addEventListener("change", () => {
       const t = state.tracks.find((x) => trackKey(x) === els.lang.value);
@@ -171,6 +194,9 @@
 
   function renderSegments() {
     if (!els) return;
+    autoFollow = true;
+    els.jumpTop.hidden = true;
+    els.jumpBottom.hidden = true;
     if (!state.segments.length) {
       els.list.innerHTML = '<div class="ylr-note">No subtitles found.</div>';
       return;
@@ -224,10 +250,12 @@
 
   function bindTimeupdate() {
     if (timeupdateBound) return;
-    const v = video();
-    if (!v) return;
-    v.addEventListener("timeupdate", tick);
     timeupdateBound = true;
+    const v = video();
+    if (v) v.addEventListener("timeupdate", tick);
+    // Poll as well: Netflix re-creates its <video> element, so a one-time
+    // timeupdate binding goes stale. tick() re-queries the element each call.
+    setInterval(tick, 250);
   }
 
   function tick() {
@@ -242,6 +270,46 @@
     if (idx !== state.activeIndex) setActive(idx);
   }
 
+  function activeRow() {
+    if (state.activeIndex < 0 || !els) return null;
+    return els.list.querySelector(`.ylr-seg[data-index="${state.activeIndex}"]`);
+  }
+
+  // "above" = playing line is scrolled off the top (user is reading ahead);
+  // "below" = off the bottom (user is behind); "visible" = in the viewport.
+  function activeVisibility() {
+    const row = activeRow();
+    if (!row) return "none";
+    const r = row.getBoundingClientRect();
+    const b = els.body.getBoundingClientRect();
+    if (r.bottom < b.top + 4) return "above";
+    if (r.top > b.bottom - 4) return "below";
+    return "visible";
+  }
+
+  function updateJumpButtons() {
+    if (!els) return;
+    const vis = activeVisibility();
+    els.jumpTop.hidden = vis !== "above";
+    els.jumpBottom.hidden = vis !== "below";
+  }
+
+  function jumpToActive() {
+    const row = activeRow();
+    if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });
+    autoFollow = true;
+    updateJumpButtons();
+  }
+
+  // User-initiated scrolling: if they scroll the playing line out of view, stop
+  // following and show the jump button; if it comes back into view, resume.
+  function onBodyScroll() {
+    hideTip();
+    const vis = activeVisibility();
+    autoFollow = vis === "visible" || vis === "none";
+    updateJumpButtons();
+  }
+
   function setActive(idx) {
     if (!els) return;
     const prev = els.list.querySelector(".ylr-seg.ylr-current");
@@ -249,10 +317,12 @@
     state.activeIndex = idx;
     if (idx < 0) return;
     const row = els.list.querySelector(`.ylr-seg[data-index="${idx}"]`);
-    if (row) {
-      row.classList.add("ylr-current");
-      row.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
+    if (!row) return;
+    row.classList.add("ylr-current");
+    // Only scroll when following, and only enough to keep the line on screen
+    // (block:nearest is a no-op while it's comfortably in view).
+    if (autoFollow) row.scrollIntoView({ block: "nearest" });
+    updateJumpButtons();
   }
 
   function showTip(row, text) {
@@ -271,9 +341,38 @@
     if (els) els.tip.hidden = true;
   }
 
+  function updateAudioStatus() {
+    if (!els || !els.audio) return;
+    els.audio.classList.toggle("ylr-audio-on", audioReady);
+    els.audio.title = audioReady
+      ? "Audio capture on"
+      : "Audio capture off — click the extension's toolbar icon to enable";
+  }
+
   // ---- capture / save ----
 
+  // Called by the adapter when a tab-capture MediaStream becomes available
+  // (Netflix, after the toolbar-icon enable). Starts recording immediately so
+  // the ring buffer is filling as you watch and starring is instant.
+  function onCaptureStream(stream) {
+    console.log("[YLR] core: capture stream received, starting ring buffer");
+    if (!capture) capture = new NS.AudioCapture(video(), { bufferSeconds: 90 });
+    capture
+      .ensureFromStream(stream)
+      .then(() => {
+        capture.resume();
+        audioReady = true;
+        updateAudioStatus();
+        console.log("[YLR] core: ring buffer recording");
+      })
+      .catch((e) => console.log("[YLR] core: ensureFromStream failed:", e.message));
+  }
+
   async function ensureCapture() {
+    if (capture && capture.ready) {
+      capture.resume();
+      return;
+    }
     if (!capture) {
       const v = video();
       if (!v) throw new Error("no video element");
@@ -281,19 +380,26 @@
     }
     await adapter.setupAudio(capture);
     capture.resume();
+    audioReady = true;
+    updateAudioStatus();
   }
 
   async function onStar(seg, starEl) {
     starEl.classList.add("ylr-capturing");
     try {
       await ensureCapture();
-      const v = video();
-      // If the phrase hasn't been played (so it isn't buffered), jump to it and
-      // play so the ring buffer fills and the capture promise can resolve.
-      const buffered = v.currentTime >= seg.end && v.currentTime - seg.end < 85;
-      if (!buffered) adapter.seek(Math.max(0, seg.start - 0.2));
-
+      console.log(
+        "[YLR] star: capturing",
+        seg.start.toFixed(2),
+        "-",
+        seg.end.toFixed(2),
+        "| ctx",
+        capture.ctx && capture.ctx.state
+      );
+      // No seeking — starring just saves. The ring buffer has been recording as
+      // you watch, so the phrase you just heard is already captured.
       const wav = await capture.capture(seg.start, seg.end);
+      console.log("[YLR] star: got wav", wav && wav.size, "bytes");
       const record = {
         id: adapter.currentMediaId() + ":" + seg.start.toFixed(2),
         videoId: adapter.currentMediaId(),
@@ -306,11 +412,19 @@
         audio: wav
       };
       await NS.db.add(record);
+      console.log("[YLR] star: saved", record.id);
       state.starred.add(seg.start);
       starEl.classList.add("ylr-starred");
       starEl.textContent = "★";
     } catch (e) {
+      console.log("[YLR] star failed:", e.message);
       alert("Couldn't save audio: " + e.message);
+      // Reset so the next attempt re-initialises the (correct) capture source.
+      if (/timed out|no audio|cancelled|blocked|tap/i.test(e.message)) {
+        capture = null;
+        audioReady = false;
+        if (adapter.resetAudio) adapter.resetAudio();
+      }
     } finally {
       starEl.classList.remove("ylr-capturing");
     }
@@ -426,6 +540,18 @@
     boot();
   });
 
-  adapter.init({ onTracks, onTranslation });
+  adapter.init({ onTracks, onTranslation, onCaptureStream });
+
+  // YouTube can tap the element directly, so start recording on the first user
+  // gesture (audio contexts need one). Then the phrase you star has already been
+  // buffered and saving is instant, with no seek/replay. Netflix waits for the
+  // toolbar-icon tab-capture instead.
+  if (adapter.name === "youtube") {
+    const startOnce = () => {
+      ensureCapture().catch((e) => console.log("[YLR] early audio init:", e.message));
+    };
+    window.addEventListener("pointerdown", startOnce, { once: true, capture: true });
+  }
+
   boot();
 })();

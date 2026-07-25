@@ -58,45 +58,70 @@
 
     // YouTube: tap the <video> element directly. The worklet passes audio
     // through to the speakers, so we must route it to the destination.
-    async ensureFromElement() {
-      if (this.ready) return;
-      await this._init();
-      let source;
-      try {
-        source = this.ctx.createMediaElementSource(this.video);
-      } catch (e) {
-        throw new Error(
-          "Could not tap the video's audio (another extension may already be capturing it)."
-        );
-      }
-      source.connect(this.node);
-      this.node.connect(this.ctx.destination);
-      this.ready = true;
+    ensureFromElement() {
+      if (this.ready) return Promise.resolve();
+      if (this._ensuring) return this._ensuring;
+      this._ensuring = (async () => {
+        await this._init();
+        let source;
+        try {
+          source = this.ctx.createMediaElementSource(this.video);
+        } catch (e) {
+          throw new Error(
+            "Could not tap the video's audio (another extension may already be capturing it)."
+          );
+        }
+        source.connect(this.node);
+        this.node.connect(this.ctx.destination);
+        this.ready = true;
+        console.log("[YLR] element tap connected; ctx state:", this.ctx.state);
+      })();
+      return this._ensuring;
     }
 
     // Netflix: DRM blocks the element tap, so we record the tab's rendered
     // output (a MediaStream from tabCapture). The tab is already audible, so the
     // worklet's passthrough is routed through a muted gain to avoid doubling it.
-    async ensureFromStream(stream) {
-      if (this.ready) return;
-      this.captureStream = stream; // keep a ref so it isn't garbage-collected
-      await this._init();
-      const source = this.ctx.createMediaStreamSource(stream);
-      const mute = this.ctx.createGain();
-      mute.gain.value = 0;
-      source.connect(this.node);
-      this.node.connect(mute);
-      mute.connect(this.ctx.destination);
-      this.ready = true;
+    ensureFromStream(stream) {
+      if (this.ready) return Promise.resolve();
+      if (this._ensuring) return this._ensuring;
+      this._ensuring = (async () => {
+        this.captureStream = stream; // keep a ref so it isn't garbage-collected
+        await this._init();
+        const source = this.ctx.createMediaStreamSource(stream);
+        const mute = this.ctx.createGain();
+        mute.gain.value = 0;
+        source.connect(this.node);
+        this.node.connect(mute);
+        mute.connect(this.ctx.destination);
+        this.ready = true;
+        console.log("[YLR] stream tap connected; ctx state:", this.ctx.state);
+      })();
+      return this._ensuring;
     }
 
     resume() {
-      if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+      if (this.ctx && this.ctx.state === "suspended") {
+        this.ctx.resume().then(
+          () => console.log("[YLR] audio ctx resumed:", this.ctx.state),
+          (e) => console.log("[YLR] audio ctx resume failed:", e.message)
+        );
+      }
     }
 
     _onChunk(data) {
       const time = this.video.currentTime;
       this.chunks.push({ time, data });
+      // Periodic peak so we can tell whether the captured stream has any sound.
+      this._dbg = (this._dbg || 0) + 1;
+      if (this._dbg % 40 === 0) {
+        let peak = 0;
+        for (let i = 0; i < data.length; i += 16) {
+          const a = Math.abs(data[i]);
+          if (a > peak) peak = a;
+        }
+        console.log("[YLR] audio in: peak", peak.toFixed(4), "@ t=", time.toFixed(2));
+      }
       const cutoff = time - this.bufferSeconds;
       while (this.chunks.length && this.chunks[0].time < cutoff) {
         this.chunks.shift();
@@ -119,7 +144,14 @@
 
     _slice(start, end) {
       const selected = this.chunks.filter((c) => c.time >= start && c.time <= end);
-      if (!selected.length) return null;
+      if (!selected.length) {
+        const times = this.chunks.map((c) => c.time);
+        console.log(
+          "[YLR] slice empty for [" + start.toFixed(2) + "," + end.toFixed(2) + "]; buffer covers",
+          times.length ? times[0].toFixed(2) + "→" + times[times.length - 1].toFixed(2) : "(empty)"
+        );
+        return null;
+      }
       let total = 0;
       for (const c of selected) total += c.data.length;
       const merged = new Float32Array(total);
@@ -128,6 +160,18 @@
         merged.set(c.data, o);
         o += c.data.length;
       }
+      let peak = 0;
+      for (let i = 0; i < merged.length; i += 16) {
+        const a = Math.abs(merged[i]);
+        if (a > peak) peak = a;
+      }
+      console.log(
+        "[YLR] slice",
+        selected.length,
+        "chunks, dur",
+        (merged.length / this.sampleRate).toFixed(2) + "s, peak",
+        peak.toFixed(4)
+      );
       return encodeWav(merged, this.sampleRate);
     }
 
@@ -149,6 +193,9 @@
           reject,
           deadline: performance.now() + (e - s) * 1000 + 15000
         });
+        // Evaluate the deadline even if no audio chunks arrive (a silent/dead
+        // tap would otherwise leave the promise hanging forever).
+        setTimeout(() => this._resolvePending(), (e - s) * 1000 + 15500);
       });
     }
 

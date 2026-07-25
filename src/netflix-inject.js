@@ -57,7 +57,9 @@
   function handleManifest(m, trackKey) {
     const list = m[trackKey || "timedtexttracks"];
     if (!Array.isArray(list)) return;
-    const sample = list.find((t) => !t.isNoneTrack) || list[0];
+    const sample = list.find(
+      (t) => !t.isNoneTrack && (t.downloadables || t.ttDownloadables)
+    );
     if (sample) {
       console.log(
         "[YLR] track dl sample:",
@@ -187,7 +189,19 @@
       const api = window.netflix.appContext.state.playerApp.getAPI().videoPlayer;
       const ids = api.getAllPlayerSessionIds();
       const sid = ids.find((i) => String(i).includes("watch")) || ids[0];
-      api.getVideoPlayerBySessionId(sid).seek(Math.floor(seconds * 1000));
+      const player = api.getVideoPlayerBySessionId(sid);
+      const before = player.getCurrentTime ? player.getCurrentTime() : "n/a";
+      player.seek(Math.floor(seconds * 1000));
+      console.log(
+        "[YLR] NF_SEEK target",
+        Math.floor(seconds * 1000),
+        "ms | player.getCurrentTime before:",
+        before,
+        "| sessions:",
+        JSON.stringify(ids),
+        "sid:",
+        sid
+      );
     } catch (e) {
       console.log("[YLR] Netflix seek failed:", e);
     }

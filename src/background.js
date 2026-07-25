@@ -1,18 +1,40 @@
-// Clicking the toolbar icon enables tab-audio capture on the active tab. The
-// click is the user gesture Chrome requires for tabCapture. We hand the
-// resulting streamId to the tab's content script, which turns it into a
-// MediaStream for the audio ring buffer (used on Netflix, where the DRM-blocked
-// element tap won't work).
+// Clicking the toolbar icon enables tab-audio capture for that tab (one gesture
+// per session — the Language Reactor model). The click is the user gesture
+// Chrome requires for tabCapture. We get a streamId and hand it to the tab's
+// content script, which turns it into a MediaStream for the audio ring buffer.
+console.log("[YLR-bg] service worker loaded");
+
 chrome.action.onClicked.addListener((tab) => {
-  if (!tab?.id) return;
+  console.log("[YLR-bg] toolbar clicked; tab", tab && tab.id, tab && tab.url);
+  if (!tab || !tab.id) {
+    console.log("[YLR-bg] no tab id");
+    return;
+  }
+  if (!chrome.tabCapture || !chrome.tabCapture.getMediaStreamId) {
+    console.log("[YLR-bg] chrome.tabCapture.getMediaStreamId unavailable");
+    chrome.tabs.sendMessage(tab.id, { type: "ENABLE_CAPTURE", error: "tabCapture API unavailable" });
+    return;
+  }
   chrome.tabCapture.getMediaStreamId(
     { targetTabId: tab.id, consumerTabId: tab.id },
     (streamId) => {
-      if (chrome.runtime.lastError || !streamId) {
-        console.log("[YLR] getMediaStreamId failed:", chrome.runtime.lastError);
+      const err = chrome.runtime.lastError;
+      if (err || !streamId) {
+        console.log("[YLR-bg] getMediaStreamId failed:", err && err.message);
+        chrome.tabs.sendMessage(tab.id, {
+          type: "ENABLE_CAPTURE",
+          error: (err && err.message) || "no streamId returned"
+        });
         return;
       }
-      chrome.tabs.sendMessage(tab.id, { type: "ENABLE_CAPTURE", streamId });
+      console.log("[YLR-bg] got streamId (len " + String(streamId).length + "); sending to tab", tab.id);
+      chrome.tabs.sendMessage(tab.id, { type: "ENABLE_CAPTURE", streamId }, () => {
+        if (chrome.runtime.lastError) {
+          console.log("[YLR-bg] sendMessage to tab failed:", chrome.runtime.lastError.message);
+        } else {
+          console.log("[YLR-bg] ENABLE_CAPTURE delivered to tab");
+        }
+      });
     }
   );
 });

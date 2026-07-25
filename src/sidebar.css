@@ -84,10 +84,42 @@ html.ylr-open #ylr-toggle {
   cursor: pointer;
   font-size: 14px;
 }
+.ylr-audio {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  filter: grayscale(1) opacity(0.5);
+}
+.ylr-audio.ylr-audio-on {
+  filter: none;
+}
 
 .ylr-body {
   flex: 1;
   overflow-y: auto;
+}
+
+.ylr-jump {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  background: #3ea6ff;
+  color: #06121f;
+  border: none;
+  border-radius: 14px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+.ylr-jump-top {
+  top: 52px;
+}
+.ylr-jump-bottom {
+  bottom: 14px;
 }
 .ylr-note {
   padding: 16px;
