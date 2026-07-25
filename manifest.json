@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Language Sidebar",
+  "version": "0.2.0",
+  "description": "Language-Reactor-style subtitle sidebar for YouTube and Netflix. Star a phrase to save its text and a real audio clip of that exact time range.",
+  "permissions": ["storage", "tabCapture"],
+  "host_permissions": ["*://*.youtube.com/*", "*://*.netflix.com/*", "*://*.nflxvideo.net/*"],
+  "action": { "default_title": "Enable audio capture on this tab" },
+  "background": { "service_worker": "src/background.js" },
+  "content_scripts": [
+    {
+      "matches": ["*://www.youtube.com/*"],
+      "js": ["src/inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://www.youtube.com/*"],
+      "js": ["src/db.js", "src/captions.js", "src/audio.js", "src/youtube.js", "src/core.js"],
+      "css": ["src/sidebar.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["*://www.netflix.com/*"],
+      "js": ["src/netflix-inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://www.netflix.com/*"],
+      "js": ["src/db.js", "src/captions.js", "src/audio.js", "src/netflix.js", "src/core.js"],
+      "css": ["src/sidebar.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/pcm-worklet.js"],
+      "matches": ["*://*.youtube.com/*", "*://*.netflix.com/*"]
+    }
+  ]
+}

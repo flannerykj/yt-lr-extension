@@ -1,0 +1,206 @@
+#ylr-sidebar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 380px;
+  height: 100vh;
+  z-index: 2147483000;
+  display: flex;
+  flex-direction: column;
+  background: #0f0f0f;
+  color: #f1f1f1;
+  border-left: 1px solid #303030;
+  font-family: Roboto, Arial, sans-serif;
+  font-size: 15px;
+  transform: translateX(100%);
+  transition: transform 0.2s ease;
+}
+html.ylr-open #ylr-sidebar {
+  transform: translateX(0);
+}
+
+#ylr-toggle {
+  position: fixed;
+  top: 72px;
+  right: 12px;
+  z-index: 2147483001;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: none;
+  background: #272727;
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+html.ylr-open #ylr-toggle {
+  right: 392px;
+}
+
+.ylr-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #303030;
+}
+.ylr-tabs {
+  display: flex;
+  gap: 4px;
+}
+.ylr-tab {
+  background: none;
+  border: none;
+  color: #aaa;
+  padding: 6px 8px;
+  cursor: pointer;
+  font-size: 14px;
+  border-bottom: 2px solid transparent;
+}
+.ylr-tab.ylr-active {
+  color: #fff;
+  border-bottom-color: #f00;
+}
+.ylr-head-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ylr-lang {
+  max-width: 150px;
+  background: #272727;
+  color: #f1f1f1;
+  border: 1px solid #3f3f3f;
+  border-radius: 4px;
+  padding: 4px;
+  font-size: 12px;
+}
+.ylr-icon {
+  background: none;
+  border: none;
+  color: #aaa;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.ylr-body {
+  flex: 1;
+  overflow-y: auto;
+}
+.ylr-note {
+  padding: 16px;
+  color: #aaa;
+  font-size: 14px;
+}
+
+.ylr-seg {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #1c1c1c;
+  cursor: pointer;
+}
+.ylr-seg:hover {
+  background: #1c1c1c;
+}
+.ylr-seg.ylr-current {
+  background: #263238;
+}
+.ylr-play,
+.ylr-star {
+  background: none;
+  border: none;
+  color: #9aa0a6;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1.4;
+  padding: 0;
+}
+.ylr-play:hover {
+  color: #fff;
+}
+.ylr-text {
+  flex: 1;
+  line-height: 1.45;
+}
+.ylr-star:hover {
+  color: #ffd54f;
+}
+.ylr-star.ylr-starred {
+  color: #ffca28;
+}
+.ylr-star.ylr-capturing {
+  color: #ffca28;
+  animation: ylr-pulse 0.8s infinite;
+}
+@keyframes ylr-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.ylr-clip {
+  padding: 12px;
+  border-bottom: 1px solid #1c1c1c;
+}
+.ylr-clip-thumb {
+  width: 100%;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  display: block;
+}
+.ylr-clip-text {
+  line-height: 1.45;
+  margin-bottom: 4px;
+}
+.ylr-clip-meta {
+  color: #888;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.ylr-clip audio {
+  width: 100%;
+  height: 34px;
+  margin-bottom: 8px;
+}
+.ylr-clip-actions {
+  display: flex;
+  gap: 14px;
+}
+.ylr-link {
+  background: none;
+  border: none;
+  color: #3ea6ff;
+  cursor: pointer;
+  font-size: 13px;
+  text-decoration: none;
+  padding: 0;
+}
+.ylr-link.ylr-danger {
+  color: #ff6d6d;
+}
+
+#ylr-tip {
+  position: fixed;
+  z-index: 2147483002;
+  max-width: 320px;
+  padding: 8px 11px;
+  background: #eef3fb;
+  color: #12203a;
+  border: 1px solid #c9d6ea;
+  border-radius: 8px;
+  font-family: Roboto, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
+/* We load caption tracks via the player to fetch them, which makes YouTube draw
+   its own captions over the video. Hide that overlay while our sidebar is open. */
+html.ylr-open .ytp-caption-window-container {
+  display: none !important;
+}

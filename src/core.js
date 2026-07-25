@@ -1,0 +1,431 @@
+// Site-agnostic sidebar: UI, state, playback sync, starring, saved clips.
+// Everything site-specific (fetching tracks/captions, seeking, audio source) is
+// delegated to NS.adapter, set by youtube.js or netflix.js before this runs.
+(function () {
+  const NS = (window.YLR = window.YLR || {});
+  const adapter = NS.adapter;
+  if (!adapter) return;
+
+  const state = {
+    tracks: [],
+    mediaId: null,
+    title: "",
+    segments: [],
+    translation: [], // cue-level target language, for hover
+    track: null,
+    activeIndex: -1,
+    starred: new Set()
+  };
+
+  let capture = null;
+  let els = null;
+  let timeupdateBound = false;
+
+  function video() {
+    return adapter.getVideo();
+  }
+
+  function trackKey(t) {
+    return t.languageCode + "|" + (t.kind || "");
+  }
+
+  // ---- handlers the adapter calls when data arrives ----
+
+  function onTracks(payload) {
+    if (!payload.tracks || !payload.tracks.length) return;
+    const isNew = payload.mediaId !== state.mediaId;
+    state.tracks = payload.tracks;
+    state.mediaId = payload.mediaId;
+    state.title = payload.title || document.title;
+    ensureUI();
+    populateLangSelect();
+    bindTimeupdate();
+    if (isNew || !state.track) selectTrack(adapter.defaultTrack(payload.tracks));
+  }
+
+  function onTranslation(payload) {
+    if (payload.mediaId && payload.mediaId !== adapter.currentMediaId()) return;
+    if (state.track && state.track.languageCode !== payload.lang) return;
+    state.translation = payload.cues || [];
+  }
+
+  // Target-language text overlapping a segment's time range. Cues share the
+  // source timeline, so match by each cue's start falling inside the span.
+  function translationFor(seg) {
+    if (!state.translation.length) return "";
+    let parts = state.translation
+      .filter((c) => c.start >= seg.start - 0.4 && c.start < seg.end)
+      .map((c) => c.text);
+    if (!parts.length) {
+      let best = null;
+      for (const c of state.translation) {
+        if (c.start <= seg.start && c.end > seg.start) best = c;
+      }
+      if (best) parts = [best.text];
+    }
+    return parts.join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  async function selectTrack(track) {
+    state.track = track;
+    state.translation = [];
+    if (els) {
+      els.lang.value = trackKey(track);
+      els.list.innerHTML = '<div class="ylr-note">Loading subtitles…</div>';
+    }
+    try {
+      const segments = await adapter.loadTrack(track);
+      if (state.track !== track) return; // a newer selection superseded this one
+      state.segments = segments || [];
+      state.activeIndex = -1;
+      renderSegments();
+    } catch (e) {
+      if (els)
+        els.list.innerHTML =
+          '<div class="ylr-note">Failed to load subtitles: ' + e.message + "</div>";
+    }
+  }
+
+  // ---- UI ----
+
+  function ensureUI() {
+    if (els) return;
+    document.documentElement.classList.add("ylr-open");
+
+    const root = document.createElement("div");
+    root.id = "ylr-sidebar";
+    root.innerHTML = `
+      <div class="ylr-head">
+        <div class="ylr-tabs">
+          <button class="ylr-tab ylr-active" data-tab="subs">Subtitles</button>
+          <button class="ylr-tab" data-tab="saved">Saved</button>
+        </div>
+        <div class="ylr-head-right">
+          <select class="ylr-lang" title="Subtitle language"></select>
+          <button class="ylr-icon ylr-close" title="Hide">✕</button>
+        </div>
+      </div>
+      <div class="ylr-body">
+        <div class="ylr-list" data-panel="subs"></div>
+        <div class="ylr-saved" data-panel="saved" hidden></div>
+      </div>`;
+    document.body.appendChild(root);
+
+    const toggle = document.createElement("button");
+    toggle.id = "ylr-toggle";
+    toggle.textContent = "字A";
+    toggle.title = "Toggle language sidebar";
+    document.body.appendChild(toggle);
+
+    const tip = document.createElement("div");
+    tip.id = "ylr-tip";
+    tip.hidden = true;
+    document.body.appendChild(tip);
+
+    els = {
+      root,
+      toggle,
+      tip,
+      lang: root.querySelector(".ylr-lang"),
+      list: root.querySelector('[data-panel="subs"]'),
+      saved: root.querySelector('[data-panel="saved"]'),
+      tabs: root.querySelectorAll(".ylr-tab")
+    };
+
+    root.querySelector(".ylr-body").addEventListener("scroll", hideTip);
+
+    els.lang.addEventListener("change", () => {
+      const t = state.tracks.find((x) => trackKey(x) === els.lang.value);
+      if (t) selectTrack(t);
+    });
+    root.querySelector(".ylr-close").addEventListener("click", () => setOpen(false));
+    toggle.addEventListener("click", () =>
+      setOpen(!document.documentElement.classList.contains("ylr-open"))
+    );
+    els.tabs.forEach((tab) =>
+      tab.addEventListener("click", () => switchTab(tab.dataset.tab))
+    );
+  }
+
+  function setOpen(open) {
+    document.documentElement.classList.toggle("ylr-open", open);
+  }
+
+  function switchTab(name) {
+    els.tabs.forEach((t) => t.classList.toggle("ylr-active", t.dataset.tab === name));
+    els.list.hidden = name !== "subs";
+    els.saved.hidden = name !== "saved";
+    if (name === "saved") renderSaved();
+  }
+
+  function populateLangSelect() {
+    if (!els) return;
+    els.lang.innerHTML = "";
+    for (const t of state.tracks) {
+      const opt = document.createElement("option");
+      opt.value = trackKey(t);
+      opt.textContent = adapter.trackLabel(t);
+      els.lang.appendChild(opt);
+    }
+  }
+
+  function renderSegments() {
+    if (!els) return;
+    if (!state.segments.length) {
+      els.list.innerHTML = '<div class="ylr-note">No subtitles found.</div>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    state.segments.forEach((seg, i) => {
+      const row = document.createElement("div");
+      row.className = "ylr-seg";
+      row.dataset.index = i;
+
+      const play = document.createElement("button");
+      play.className = "ylr-play";
+      play.textContent = "▶";
+      play.title = "Play from here";
+      play.addEventListener("click", (e) => {
+        e.stopPropagation();
+        adapter.seek(seg.start);
+      });
+
+      const text = document.createElement("div");
+      text.className = "ylr-text";
+      text.textContent = seg.text;
+      text.addEventListener("click", () => adapter.seek(seg.start));
+
+      const star = document.createElement("button");
+      star.className = "ylr-star";
+      star.textContent = "☆";
+      star.title = "Save phrase + audio clip";
+      if (state.starred.has(seg.start)) {
+        star.classList.add("ylr-starred");
+        star.textContent = "★";
+      }
+      star.addEventListener("click", (e) => {
+        e.stopPropagation();
+        onStar(seg, star);
+      });
+
+      row.addEventListener("mouseenter", () => showTip(row, translationFor(seg)));
+      row.addEventListener("mouseleave", hideTip);
+
+      row.appendChild(play);
+      row.appendChild(text);
+      row.appendChild(star);
+      frag.appendChild(row);
+    });
+    els.list.innerHTML = "";
+    els.list.appendChild(frag);
+  }
+
+  // ---- playback sync ----
+
+  function bindTimeupdate() {
+    if (timeupdateBound) return;
+    const v = video();
+    if (!v) return;
+    v.addEventListener("timeupdate", tick);
+    timeupdateBound = true;
+  }
+
+  function tick() {
+    const v = video();
+    if (!v || !state.segments.length) return;
+    const t = v.currentTime;
+    let idx = -1;
+    for (let i = 0; i < state.segments.length; i++) {
+      if (state.segments[i].start <= t + 0.05) idx = i;
+      else break;
+    }
+    if (idx !== state.activeIndex) setActive(idx);
+  }
+
+  function setActive(idx) {
+    if (!els) return;
+    const prev = els.list.querySelector(".ylr-seg.ylr-current");
+    if (prev) prev.classList.remove("ylr-current");
+    state.activeIndex = idx;
+    if (idx < 0) return;
+    const row = els.list.querySelector(`.ylr-seg[data-index="${idx}"]`);
+    if (row) {
+      row.classList.add("ylr-current");
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }
+
+  function showTip(row, text) {
+    if (!text) {
+      hideTip();
+      return;
+    }
+    els.tip.textContent = text;
+    els.tip.hidden = false;
+    const r = row.getBoundingClientRect();
+    els.tip.style.top = Math.max(8, r.top) + "px";
+    els.tip.style.right = window.innerWidth - r.left + 8 + "px";
+  }
+
+  function hideTip() {
+    if (els) els.tip.hidden = true;
+  }
+
+  // ---- capture / save ----
+
+  async function ensureCapture() {
+    if (!capture) {
+      const v = video();
+      if (!v) throw new Error("no video element");
+      capture = new NS.AudioCapture(v, { bufferSeconds: 90 });
+    }
+    await adapter.setupAudio(capture);
+    capture.resume();
+  }
+
+  async function onStar(seg, starEl) {
+    starEl.classList.add("ylr-capturing");
+    try {
+      await ensureCapture();
+      const v = video();
+      // If the phrase hasn't been played (so it isn't buffered), jump to it and
+      // play so the ring buffer fills and the capture promise can resolve.
+      const buffered = v.currentTime >= seg.end && v.currentTime - seg.end < 85;
+      if (!buffered) adapter.seek(Math.max(0, seg.start - 0.2));
+
+      const wav = await capture.capture(seg.start, seg.end);
+      const record = {
+        id: adapter.currentMediaId() + ":" + seg.start.toFixed(2),
+        videoId: adapter.currentMediaId(),
+        videoTitle: state.title,
+        url: adapter.clipUrl(seg),
+        text: seg.text,
+        start: seg.start,
+        end: seg.end,
+        createdAt: Date.now(),
+        audio: wav
+      };
+      await NS.db.add(record);
+      state.starred.add(seg.start);
+      starEl.classList.add("ylr-starred");
+      starEl.textContent = "★";
+    } catch (e) {
+      alert("Couldn't save audio: " + e.message);
+    } finally {
+      starEl.classList.remove("ylr-capturing");
+    }
+  }
+
+  // ---- Saved tab ----
+
+  async function renderSaved() {
+    els.saved.innerHTML = '<div class="ylr-note">Loading…</div>';
+    let clips;
+    try {
+      clips = await NS.db.all();
+    } catch (e) {
+      els.saved.innerHTML = '<div class="ylr-note">Could not read saved clips.</div>';
+      return;
+    }
+    if (!clips.length) {
+      els.saved.innerHTML =
+        '<div class="ylr-note">No saved clips yet. Star a subtitle to save its text and audio.</div>';
+      return;
+    }
+    els.saved.innerHTML = "";
+    for (const clip of clips) {
+      const card = document.createElement("div");
+      card.className = "ylr-clip";
+
+      const text = document.createElement("div");
+      text.className = "ylr-clip-text";
+      text.textContent = clip.text;
+
+      const meta = document.createElement("div");
+      meta.className = "ylr-clip-meta";
+      meta.textContent =
+        clip.videoTitle + " · " + formatTime(clip.start) + "–" + formatTime(clip.end);
+
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.src = URL.createObjectURL(clip.audio);
+
+      const actions = document.createElement("div");
+      actions.className = "ylr-clip-actions";
+
+      const dl = document.createElement("a");
+      dl.className = "ylr-link";
+      dl.textContent = "Download";
+      dl.href = audio.src;
+      dl.download = safeName(clip.text) + ".wav";
+
+      const open = document.createElement("a");
+      open.className = "ylr-link";
+      open.textContent = "Open in video";
+      open.href = clip.url;
+      open.target = "_blank";
+
+      const del = document.createElement("button");
+      del.className = "ylr-link ylr-danger";
+      del.textContent = "Delete";
+      del.addEventListener("click", async () => {
+        await NS.db.remove(clip.id);
+        state.starred.delete(clip.start);
+        card.remove();
+        renderSegments();
+        tick();
+      });
+
+      actions.appendChild(dl);
+      actions.appendChild(open);
+      actions.appendChild(del);
+
+      if (clip.thumb) {
+        const img = document.createElement("img");
+        img.className = "ylr-clip-thumb";
+        img.src = URL.createObjectURL(clip.thumb);
+        card.appendChild(img);
+      }
+      card.appendChild(text);
+      card.appendChild(meta);
+      card.appendChild(audio);
+      card.appendChild(actions);
+      els.saved.appendChild(card);
+    }
+  }
+
+  function formatTime(s) {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return m + ":" + String(sec).padStart(2, "0");
+  }
+
+  function safeName(text) {
+    return text.slice(0, 40).replace(/[^\p{L}\p{N} _-]/gu, "").trim() || "clip";
+  }
+
+  // ---- boot / navigation ----
+
+  function boot() {
+    if (!adapter.isWatchPage()) return;
+    ensureUI();
+    if (!state.segments.length && els) {
+      els.list.innerHTML = '<div class="ylr-note">Loading subtitles…</div>';
+    }
+    adapter.requestTracks();
+  }
+
+  adapter.onNavigate(() => {
+    if (adapter.currentMediaId() !== state.mediaId) {
+      state.mediaId = null;
+      state.track = null;
+      state.segments = [];
+      state.translation = [];
+      state.starred = new Set();
+    }
+    boot();
+  });
+
+  adapter.init({ onTracks, onTranslation });
+  boot();
+})();
