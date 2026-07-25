@@ -5,6 +5,7 @@
   let handlers = null;
   const captionCache = new Map(); // "lang|kind" -> json3 text
   const pendingSelections = new Map(); // languageCode -> { resolve, reject }
+  const pendingAudio = new Map(); // reply type -> { promise, resolve, reject }
 
   function getVideo() {
     return document.querySelector(
@@ -69,7 +70,40 @@
           cues: NS.parseJson3Cues(d.text)
         });
       } catch (e) {}
+    } else if (
+      d.type === "AUDIO_SOURCE" ||
+      d.type === "AUDIO_BYTES" ||
+      d.type === "AUDIO_SEGMENTS"
+    ) {
+      const p = pendingAudio.get(d.type);
+      if (p) {
+        pendingAudio.delete(d.type);
+        if (d.ok) p.resolve(d);
+        else p.reject(new Error(d.reason || "no audio stream available"));
+      }
     }
+  }
+
+  function askPage(requestType, replyType, timeoutMs, payload) {
+    const existing = pendingAudio.get(replyType);
+    if (existing) return existing.promise;
+    const entry = {};
+    entry.promise = new Promise((resolve, reject) => {
+      entry.resolve = resolve;
+      entry.reject = reject;
+      setTimeout(() => {
+        if (pendingAudio.get(replyType) === entry) {
+          pendingAudio.delete(replyType);
+          reject(new Error("timed out getting the audio stream from the page"));
+        }
+      }, timeoutMs);
+    });
+    pendingAudio.set(replyType, entry);
+    window.postMessage(
+      Object.assign({ source: "YLR-CS", type: requestType }, payload || {}),
+      "*"
+    );
+    return entry.promise;
   }
 
   NS.adapter = {
@@ -115,6 +149,15 @@
     },
     async setupAudio(capture) {
       await capture.ensureFromElement();
+    },
+    audioSegments(start, end) {
+      return askPage("REQUEST_AUDIO_SEGMENTS", "AUDIO_SEGMENTS", 8000, { start, end });
+    },
+    audioSource() {
+      return askPage("REQUEST_AUDIO_SOURCE", "AUDIO_SOURCE", 8000);
+    },
+    audioBytes() {
+      return askPage("REQUEST_AUDIO_BYTES", "AUDIO_BYTES", 120000);
     }
   };
 })();

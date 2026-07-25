@@ -18,13 +18,20 @@
   };
 
   let capture = null;
+  let extractor = null;
   let audioReady = false;
   let els = null;
   let timeupdateBound = false;
   let autoFollow = true; // keep the playing line in view until the user scrolls away
+  let activeTab = "subs";
 
   function video() {
     return adapter.getVideo();
+  }
+
+  function liveTime() {
+    const v = video();
+    return v ? v.currentTime : NaN;
   }
 
   function trackKey(t) {
@@ -112,8 +119,7 @@
         <div class="ylr-list" data-panel="subs"></div>
         <div class="ylr-saved" data-panel="saved" hidden></div>
       </div>
-      <button class="ylr-jump ylr-jump-top" hidden>↑ Now playing</button>
-      <button class="ylr-jump ylr-jump-bottom" hidden>↓ Now playing</button>`;
+      <button class="ylr-jump" hidden>↑ Now playing</button>`;
     document.body.appendChild(root);
 
     const toggle = document.createElement("button");
@@ -136,12 +142,10 @@
       body: root.querySelector(".ylr-body"),
       list: root.querySelector('[data-panel="subs"]'),
       saved: root.querySelector('[data-panel="saved"]'),
-      jumpTop: root.querySelector(".ylr-jump-top"),
-      jumpBottom: root.querySelector(".ylr-jump-bottom"),
+      jump: root.querySelector(".ylr-jump"),
       tabs: root.querySelectorAll(".ylr-tab")
     };
-    els.jumpTop.addEventListener("click", jumpToActive);
-    els.jumpBottom.addEventListener("click", jumpToActive);
+    els.jump.addEventListener("click", jumpToActive);
 
     // The mic pill is only meaningful where audio needs enabling (Netflix); the
     // element tap on YouTube just works on first star.
@@ -175,10 +179,12 @@
   }
 
   function switchTab(name) {
+    activeTab = name;
     els.tabs.forEach((t) => t.classList.toggle("ylr-active", t.dataset.tab === name));
     els.list.hidden = name !== "subs";
     els.saved.hidden = name !== "saved";
     if (name === "saved") renderSaved();
+    updateJumpButtons();
   }
 
   function populateLangSelect() {
@@ -195,8 +201,7 @@
   function renderSegments() {
     if (!els) return;
     autoFollow = true;
-    els.jumpTop.hidden = true;
-    els.jumpBottom.hidden = true;
+    els.jump.hidden = true;
     if (!state.segments.length) {
       els.list.innerHTML = '<div class="ylr-note">No subtitles found.</div>';
       return;
@@ -277,8 +282,7 @@
 
   // "above" = playing line is scrolled off the top (user is reading ahead);
   // "below" = off the bottom (user is behind); "visible" = in the viewport.
-  function activeVisibility() {
-    const row = activeRow();
+  function rowVisibility(row) {
     if (!row) return "none";
     const r = row.getBoundingClientRect();
     const b = els.body.getBoundingClientRect();
@@ -287,16 +291,28 @@
     return "visible";
   }
 
+  function activeVisibility() {
+    return rowVisibility(activeRow());
+  }
+
+  function rowFullyVisible(row) {
+    if (!row) return false;
+    const r = row.getBoundingClientRect();
+    const b = els.body.getBoundingClientRect();
+    return r.top >= b.top - 1 && r.bottom <= b.bottom + 1;
+  }
+
   function updateJumpButtons() {
     if (!els) return;
-    const vis = activeVisibility();
-    els.jumpTop.hidden = vis !== "above";
-    els.jumpBottom.hidden = vis !== "below";
+    const vis = activeTab === "subs" ? activeVisibility() : "none";
+    els.jump.hidden = vis !== "above" && vis !== "below";
+    if (!els.jump.hidden)
+      els.jump.textContent = (vis === "above" ? "↑" : "↓") + " Now playing";
   }
 
   function jumpToActive() {
     const row = activeRow();
-    if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (row) row.scrollIntoView({ block: "start", behavior: "smooth" });
     autoFollow = true;
     updateJumpButtons();
   }
@@ -313,15 +329,23 @@
   function setActive(idx) {
     if (!els) return;
     const prev = els.list.querySelector(".ylr-seg.ylr-current");
+    const prevWasOnScreen = !prev || rowVisibility(prev) === "visible";
     if (prev) prev.classList.remove("ylr-current");
     state.activeIndex = idx;
     if (idx < 0) return;
     const row = els.list.querySelector(`.ylr-seg[data-index="${idx}"]`);
     if (!row) return;
     row.classList.add("ylr-current");
-    // Only scroll when following, and only enough to keep the line on screen
-    // (block:nearest is a no-op while it's comfortably in view).
-    if (autoFollow) row.scrollIntoView({ block: "nearest" });
+    // Once the playing line runs off the edge, pull it back to the top so the
+    // upcoming lines fill the panel. Only when the previous line was on screen —
+    // otherwise the user has scrolled away and we leave them alone.
+    if (
+      autoFollow &&
+      activeTab === "subs" &&
+      prevWasOnScreen &&
+      !rowFullyVisible(row)
+    )
+      row.scrollIntoView({ block: "start" });
     updateJumpButtons();
   }
 
@@ -356,7 +380,7 @@
   // the ring buffer is filling as you watch and starring is instant.
   function onCaptureStream(stream) {
     console.log("[YLR] core: capture stream received, starting ring buffer");
-    if (!capture) capture = new NS.AudioCapture(video(), { bufferSeconds: 90 });
+    if (!capture) capture = new NS.AudioCapture(video(), { bufferSeconds: 90, liveTime });
     capture
       .ensureFromStream(stream)
       .then(() => {
@@ -369,23 +393,36 @@
   }
 
   async function ensureCapture() {
+    const v = video();
+    if (!v) throw new Error("no video element");
+    // Both sites can swap the <video> element out from under us (SPA nav). Chunks
+    // are time-tagged from capture.video, so a stale ref stops the buffer dead.
+    if (capture && capture.video !== v) {
+      if (capture.captureStream) capture.video = v;
+      else capture = null;
+    }
     if (capture && capture.ready) {
       capture.resume();
       return;
     }
-    if (!capture) {
-      const v = video();
-      if (!v) throw new Error("no video element");
-      capture = new NS.AudioCapture(v, { bufferSeconds: 90 });
-    }
+    if (!capture) capture = new NS.AudioCapture(v, { bufferSeconds: 90, liveTime });
     await adapter.setupAudio(capture);
     capture.resume();
     audioReady = true;
     updateAudioStatus();
   }
 
-  async function onStar(seg, starEl) {
-    starEl.classList.add("ylr-capturing");
+  function ensureExtractor() {
+    if (!NS.ClipExtractor) return null;
+    if (!adapter.audioSegments && !adapter.audioSource) return null;
+    if (!extractor) extractor = new NS.ClipExtractor(adapter);
+    return extractor;
+  }
+
+  // The live ring buffer is instant but only holds what has played through the
+  // tap. Anything else — a line ahead of the playhead, or one that has already
+  // scrolled out of the buffer — is re-recorded from the audio-only stream.
+  async function clipFor(seg) {
     try {
       await ensureCapture();
       console.log(
@@ -396,9 +433,26 @@
         "| ctx",
         capture.ctx && capture.ctx.state
       );
-      // No seeking — starring just saves. The ring buffer has been recording as
-      // you watch, so the phrase you just heard is already captured.
-      const wav = await capture.capture(seg.start, seg.end);
+      return await capture.capture(seg.start, seg.end, {
+        immediate: !!(adapter.audioSegments && ensureExtractor())
+      });
+    } catch (e) {
+      console.log("[YLR] live buffer miss:", e.message);
+      if (/no audio|cancelled|blocked|tap/i.test(e.message)) {
+        capture = null;
+        audioReady = false;
+        if (adapter.resetAudio) adapter.resetAudio();
+      }
+      const ex = ensureExtractor();
+      if (!ex) throw e;
+      return await ex.extract(adapter.currentMediaId(), seg.start, seg.end);
+    }
+  }
+
+  async function onStar(seg, starEl) {
+    starEl.classList.add("ylr-capturing");
+    try {
+      const wav = await clipFor(seg);
       console.log("[YLR] star: got wav", wav && wav.size, "bytes");
       const record = {
         id: adapter.currentMediaId() + ":" + seg.start.toFixed(2),
@@ -419,12 +473,6 @@
     } catch (e) {
       console.log("[YLR] star failed:", e.message);
       alert("Couldn't save audio: " + e.message);
-      // Reset so the next attempt re-initialises the (correct) capture source.
-      if (/timed out|no audio|cancelled|blocked|tap/i.test(e.message)) {
-        capture = null;
-        audioReady = false;
-        if (adapter.resetAudio) adapter.resetAudio();
-      }
     } finally {
       starEl.classList.remove("ylr-capturing");
     }

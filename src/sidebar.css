@@ -102,6 +102,7 @@ html.ylr-open #ylr-toggle {
 
 .ylr-jump {
   position: absolute;
+  top: 52px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 5;
@@ -114,12 +115,6 @@ html.ylr-open #ylr-toggle {
   font-weight: 600;
   cursor: pointer;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
-}
-.ylr-jump-top {
-  top: 52px;
-}
-.ylr-jump-bottom {
-  bottom: 14px;
 }
 .ylr-note {
   padding: 16px;

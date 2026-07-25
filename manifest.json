@@ -16,7 +16,14 @@
     },
     {
       "matches": ["*://www.youtube.com/*"],
-      "js": ["src/db.js", "src/captions.js", "src/audio.js", "src/youtube.js", "src/core.js"],
+      "js": [
+        "src/db.js",
+        "src/captions.js",
+        "src/audio.js",
+        "src/clip-extractor.js",
+        "src/youtube.js",
+        "src/core.js"
+      ],
       "css": ["src/sidebar.css"],
       "run_at": "document_idle",
       "world": "ISOLATED"

@@ -35,10 +35,12 @@
   }
 
   class AudioCapture {
-    constructor(video, { bufferSeconds = 90 } = {}) {
+    constructor(video, { bufferSeconds = 90, liveTime = null } = {}) {
       this.video = video;
       this.bufferSeconds = bufferSeconds;
+      this.liveTime = liveTime; // current time of the live element, for staleness checks
       this.chunks = []; // { time, data: Float32Array }
+      this.samples = 0;
       this.ctx = null;
       this.node = null;
       this.ready = false;
@@ -46,8 +48,8 @@
       this._pending = [];
     }
 
-    async _init() {
-      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    async _init(existingCtx) {
+      this.ctx = existingCtx || new (window.AudioContext || window.webkitAudioContext)();
       this.sampleRate = this.ctx.sampleRate;
       await this.ctx.audioWorklet.addModule(
         chrome.runtime.getURL("src/pcm-worklet.js")
@@ -58,23 +60,47 @@
 
     // YouTube: tap the <video> element directly. The worklet passes audio
     // through to the speakers, so we must route it to the destination.
-    ensureFromElement() {
+    ensureFromElement({ silent = false } = {}) {
       if (this.ready) return Promise.resolve();
       if (this._ensuring) return this._ensuring;
       this._ensuring = (async () => {
-        await this._init();
+        // An element can only ever be passed to createMediaElementSource once, so
+        // the node (and its context) is cached on the element and reused if this
+        // capture is rebuilt — a second call would throw and kill the tab's audio.
+        const cached = this.video.__ylrTap;
         let source;
-        try {
-          source = this.ctx.createMediaElementSource(this.video);
-        } catch (e) {
-          throw new Error(
-            "Could not tap the video's audio (another extension may already be capturing it)."
-          );
+        if (cached) {
+          await this._init(cached.ctx);
+          source = cached.source;
+          source.disconnect();
+        } else {
+          await this._init();
+          try {
+            source = this.ctx.createMediaElementSource(this.video);
+          } catch (e) {
+            throw new Error(
+              "Could not tap the video's audio (another extension may already be capturing it)."
+            );
+          }
+          this.video.__ylrTap = { ctx: this.ctx, source };
         }
         source.connect(this.node);
-        this.node.connect(this.ctx.destination);
+        // The worklet passes audio through, so the live tap must reach the
+        // speakers. A silent tap (clip extraction from a hidden element) must
+        // not — the worklet still needs a sink to keep pulling, hence gain 0.
+        if (silent) {
+          const mute = this.ctx.createGain();
+          mute.gain.value = 0;
+          this.node.connect(mute);
+          mute.connect(this.ctx.destination);
+        } else {
+          this.node.connect(this.ctx.destination);
+        }
         this.ready = true;
-        console.log("[YLR] element tap connected; ctx state:", this.ctx.state);
+        console.log(
+          "[YLR] element tap connected" + (silent ? " (silent)" : "") + "; ctx state:",
+          this.ctx.state
+        );
       })();
       return this._ensuring;
     }
@@ -100,6 +126,11 @@
       return this._ensuring;
     }
 
+    reset() {
+      this.chunks = [];
+      this.samples = 0;
+    }
+
     resume() {
       if (this.ctx && this.ctx.state === "suspended") {
         this.ctx.resume().then(
@@ -112,6 +143,7 @@
     _onChunk(data) {
       const time = this.video.currentTime;
       this.chunks.push({ time, data });
+      this.samples += data.length;
       // Periodic peak so we can tell whether the captured stream has any sound.
       this._dbg = (this._dbg || 0) + 1;
       if (this._dbg % 40 === 0) {
@@ -124,9 +156,28 @@
       }
       const cutoff = time - this.bufferSeconds;
       while (this.chunks.length && this.chunks[0].time < cutoff) {
-        this.chunks.shift();
+        this.samples -= this.chunks.shift().data.length;
+      }
+      // Time-tag eviction does nothing if the tags stop advancing (a dead or
+      // stale element tap), so cap the raw sample count too — otherwise the
+      // buffer grows without bound and drags the whole page down.
+      const maxSamples = this.bufferSeconds * this.sampleRate * 1.5;
+      while (this.chunks.length > 1 && this.samples > maxSamples) {
+        this.samples -= this.chunks.shift().data.length;
       }
       this._resolvePending();
+    }
+
+    // Oldest/newest video-time tags currently in the ring buffer.
+    _bufferRange() {
+      if (!this.chunks.length) return null;
+      let first = Infinity;
+      let last = -Infinity;
+      for (const c of this.chunks) {
+        if (c.time < first) first = c.time;
+        if (c.time > last) last = c.time;
+      }
+      return { first, last };
     }
 
     _covered(start, end) {
@@ -178,7 +229,7 @@
     // Resolves with a WAV Blob for [start,end]. If not yet buffered (a segment
     // ahead of playback), the promise stays pending and is fulfilled once the
     // buffer fills — the caller is expected to seek/play to make that happen.
-    capture(start, end, { pad = 0.15 } = {}) {
+    capture(start, end, { pad = 0.15, waitForPlayback = false, immediate = false } = {}) {
       const s = Math.max(0, start - pad);
       const e = end + pad;
       return new Promise((resolve, reject) => {
@@ -186,17 +237,74 @@
           const wav = this._slice(s, e);
           if (wav) return resolve(wav);
         }
-        this._pending.push({
-          start: s,
-          end: e,
-          resolve,
-          reject,
-          deadline: performance.now() + (e - s) * 1000 + 15000
-        });
-        // Evaluate the deadline even if no audio chunks arrive (a silent/dead
-        // tap would otherwise leave the promise hanging forever).
-        setTimeout(() => this._resolvePending(), (e - s) * 1000 + 15500);
+        // The clip extractor drives its own element into the range on purpose, so
+        // "not buffered yet" is the expected state there — just wait.
+        if (waitForPlayback) return this._wait(s, e, resolve, reject);
+        // Waiting only helps if playback is still heading into this range. Every
+        // other case is diagnosable right now, so fail immediately with the
+        // reason rather than stalling for the deadline.
+        const range = this._bufferRange();
+        const live = this.liveTime ? this.liveTime() : this.video.currentTime;
+        console.log(
+          "[YLR] capture miss: want",
+          s.toFixed(2) + "→" + e.toFixed(2),
+          "| buffer",
+          range ? range.first.toFixed(2) + "→" + range.last.toFixed(2) : "(empty)",
+          "| tagged from t=",
+          this.video.currentTime.toFixed(2),
+          "| live t=",
+          Number(live).toFixed(2),
+          "| paused",
+          this.video.paused,
+          "| ctx",
+          this.ctx && this.ctx.state,
+          "| chunks",
+          this.chunks.length
+        );
+        if (range) {
+          // Tags come from this.video; if the element that is actually playing has
+          // moved on without us, the tap is on a dead element and will never
+          // cover anything. Message says "tap" so the caller rebuilds.
+          if (isFinite(live) && live - this.video.currentTime > 1.5) {
+            return reject(
+              new Error("the audio tap is on a stale video element — starring again should re-tap it.")
+            );
+          }
+          if (range.last >= e - 0.4) {
+            return reject(
+              new Error("that line isn't in the audio buffer — replay it, then star it.")
+            );
+          }
+          if (this.video.paused) {
+            return reject(
+              new Error("audio is recorded as it plays — play that line, then star it.")
+            );
+          }
+          // Far enough ahead of playback that waiting would just stall.
+          if (e > this.video.currentTime + 3) {
+            return reject(
+              new Error("that line hasn't played yet — play it, then star it.")
+            );
+          }
+        }
+        // Caller has a better source for anything not already buffered, so don't
+        // sit here waiting for playback to reach the line.
+        if (immediate) return reject(new Error("not in the live buffer yet"));
+        this._wait(s, e, resolve, reject);
       });
+    }
+
+    _wait(s, e, resolve, reject) {
+      this._pending.push({
+        start: s,
+        end: e,
+        resolve,
+        reject,
+        deadline: performance.now() + (e - s) * 1000 + 15000
+      });
+      // Evaluate the deadline even if no audio chunks arrive (a silent/dead
+      // tap would otherwise leave the promise hanging forever).
+      setTimeout(() => this._resolvePending(), (e - s) * 1000 + 15500);
     }
 
     _resolvePending() {
@@ -215,7 +323,11 @@
           if (wav) p.resolve(wav);
           else
             p.reject(
-              new Error("Timed out capturing audio — try playing the segment first.")
+              new Error(
+                this.chunks.length
+                  ? "timed out capturing audio — try playing the segment first."
+                  : "no audio is reaching the recorder."
+              )
             );
           return false;
         }
