@@ -82,7 +82,8 @@
       segments.push({
         start: current[0].start,
         end: current[current.length - 1].end,
-        text: join(current.map((w) => w.text))
+        text: join(current.map((w) => w.text)),
+        words: current.map((w) => ({ text: w.text, start: w.start, end: w.end }))
       });
       current = [];
     };
@@ -226,6 +227,7 @@
     return cues;
   }
 
+  NS.isCJK = isCJK;
   NS.parseJson3 = parseJson3;
   NS.parseJson3Cues = parseJson3Cues;
   NS.parseWebVTT = parseWebVTT;

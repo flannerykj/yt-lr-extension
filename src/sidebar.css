@@ -129,6 +129,10 @@ html.ylr-open #ylr-toggle {
   padding: 10px 12px;
   border-bottom: 1px solid #1c1c1c;
   cursor: pointer;
+  /* Dragging across lines must select subtitle text only — never the ▶/☆
+     glyphs, which would otherwise land in the selection and the saved text. */
+  user-select: none;
+  -webkit-user-select: none;
 }
 .ylr-seg:hover {
   background: #1c1c1c;
@@ -152,6 +156,25 @@ html.ylr-open #ylr-toggle {
 .ylr-text {
   flex: 1;
   line-height: 1.45;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+.ylr-w {
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.ylr-w:hover {
+  background: #37474f;
+}
+.ylr-w-on {
+  background: #ffca28;
+  color: #14110a;
+}
+.ylr-text::selection,
+.ylr-w::selection {
+  background: #ffca28;
+  color: #14110a;
 }
 .ylr-star:hover {
   color: #ffd54f;
@@ -180,8 +203,22 @@ html.ylr-open #ylr-toggle {
   display: block;
 }
 .ylr-clip-text {
-  line-height: 1.45;
-  margin-bottom: 4px;
+  line-height: 1.6;
+  margin-bottom: 5px;
+}
+.ylr-clip-text mark {
+  background: #ffca28;
+  color: #14110a;
+  border-radius: 3px;
+  padding: 1px 3px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.ylr-clip-tr {
+  color: #c8d2df;
+  font-size: 13px;
+  line-height: 1.4;
+  margin-bottom: 6px;
 }
 .ylr-clip-meta {
   color: #888;
@@ -208,6 +245,59 @@ html.ylr-open #ylr-toggle {
 }
 .ylr-link.ylr-danger {
   color: #ff6d6d;
+}
+
+#ylr-menu {
+  position: fixed;
+  z-index: 2147483003;
+  background: #eef3fb;
+  color: #12203a;
+  border: 1px solid #c9d6ea;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-family: Roboto, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.ylr-menu-sel {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.ylr-menu-tr {
+  margin-bottom: 10px;
+}
+.ylr-menu-empty {
+  color: #6b7a90;
+  font-style: italic;
+}
+.ylr-menu-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ylr-menu-save {
+  flex: 1;
+  background: #1769aa;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ylr-menu-save:disabled {
+  background: #7d93ab;
+  cursor: default;
+}
+.ylr-menu-close {
+  background: none;
+  border: none;
+  color: #6b7a90;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px 6px;
 }
 
 #ylr-tip {
