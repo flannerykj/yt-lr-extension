@@ -4,10 +4,24 @@
 // content script, which turns it into a MediaStream for the audio ring buffer.
 console.log("[YLR-bg] service worker loaded");
 
+function hostOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch (e) {
+    return "";
+  }
+}
+
+function openLibrary() {
+  chrome.tabs.create({ url: chrome.runtime.getURL("library.html") });
+}
+
 chrome.action.onClicked.addListener((tab) => {
   console.log("[YLR-bg] toolbar clicked; tab", tab && tab.id, tab && tab.url);
-  if (!tab || !tab.id) {
-    console.log("[YLR-bg] no tab id");
+  // Netflix still needs the click as its tabCapture gesture (nothing else can
+  // grant it); everywhere else the click opens the saved-clips library.
+  if (!tab || !tab.id || !/(^|\.)netflix\.com$/.test(hostOf(tab.url))) {
+    openLibrary();
     return;
   }
   if (!chrome.tabCapture || !chrome.tabCapture.getMediaStreamId) {

@@ -192,6 +192,23 @@ html.ylr-open #ylr-toggle {
   }
 }
 
+.ylr-saved-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #1c1c1c;
+}
+.ylr-saved-count {
+  color: #888;
+  font-size: 12px;
+}
+.ylr-saved-bar button:disabled {
+  color: #666;
+  cursor: default;
+}
+
 .ylr-clip {
   padding: 12px;
   border-bottom: 1px solid #1c1c1c;

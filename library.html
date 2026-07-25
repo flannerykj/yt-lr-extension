@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Saved clips</title>
+  </head>
+  <body>
+    <header>
+      <h1>Saved clips</h1>
+      <div class="sub" id="status">Looking for an open YouTube or Netflix tab…</div>
+      <div class="controls">
+        <input type="search" id="q" placeholder="Search text, translation or video" />
+        <select id="sort">
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="video">Group by video</option>
+        </select>
+      </div>
+    </header>
+    <main id="list"></main>
+    <script src="src/library-view.js"></script>
+    <script src="src/library-page.js"></script>
+  </body>
+</html>

@@ -804,6 +804,7 @@
       return;
     }
     els.saved.innerHTML = "";
+    els.saved.appendChild(savedToolbar(clips));
     for (const clip of clips) {
       const card = document.createElement("div");
       card.className = "ylr-clip";
@@ -871,6 +872,56 @@
       card.appendChild(actions);
       els.saved.appendChild(card);
     }
+  }
+
+  // Exports every clip as one self-contained HTML file: audio inlined as data
+  // URIs so it opens straight off the disk, with nothing hosted anywhere.
+  function savedToolbar(clips) {
+    const bar = document.createElement("div");
+    bar.className = "ylr-saved-bar";
+
+    const count = document.createElement("span");
+    const bytes = clips.reduce((n, c) => n + ((c.audio && c.audio.size) || 0), 0);
+    count.className = "ylr-saved-count";
+    count.textContent =
+      clips.length + (clips.length === 1 ? " clip" : " clips") + " · " + mb(bytes);
+
+    const btn = document.createElement("button");
+    btn.className = "ylr-link";
+    btn.textContent = "⬇ Export library";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        const html = await NS.buildLibraryHtml(clips, (done, total) => {
+          btn.textContent = "Embedding audio " + done + "/" + total + "…";
+        });
+        btn.textContent = "Building file…";
+        const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "passage-library-" + new Date().toISOString().slice(0, 10) + ".html";
+        document.body.appendChild(a); // detached anchors don't always download
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        btn.textContent = "⬇ Export library";
+      } catch (e) {
+        console.log("[YLR] export failed:", e.message);
+        alert("Couldn't export the library: " + e.message);
+        btn.textContent = "⬇ Export library";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    bar.appendChild(count);
+    bar.appendChild(btn);
+    return bar;
+  }
+
+  function mb(bytes) {
+    if (bytes < 1048576) return Math.max(1, Math.round(bytes / 1024)) + " KB";
+    return (bytes / 1048576).toFixed(1) + " MB";
   }
 
   function formatTime(s) {
