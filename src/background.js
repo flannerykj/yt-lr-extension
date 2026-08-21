@@ -16,11 +16,33 @@ function openLibrary() {
   chrome.tabs.create({ url: chrome.runtime.getURL("library.html") });
 }
 
+// DRM sites (Netflix, Prime Video) can't have their <video> tapped, so their
+// audio comes from tabCapture — which needs this click as its user gesture.
+function needsTabCapture(url) {
+  return /(^|\.)(netflix\.com|primevideo\.com)$/.test(hostOf(url));
+}
+
+// Amazon's subtitle CDN doesn't reliably send CORS headers for the page origin,
+// so the content script asks the worker (which has host access) to fetch for it.
+chrome.runtime.onMessage.addListener((msg, sender, respond) => {
+  if (!msg || msg.type !== "YLR_FETCH_TEXT") return;
+  fetch(msg.url, { credentials: "omit" })
+    .then((res) => {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.text();
+    })
+    .then((text) => respond({ ok: true, text }))
+    .catch((e) => {
+      console.log("[YLR-bg] fetch failed:", msg.url, e.message);
+      respond({ ok: false, error: e.message });
+    });
+  return true;
+});
+
 chrome.action.onClicked.addListener((tab) => {
   console.log("[YLR-bg] toolbar clicked; tab", tab && tab.id, tab && tab.url);
-  // Netflix still needs the click as its tabCapture gesture (nothing else can
-  // grant it); everywhere else the click opens the saved-clips library.
-  if (!tab || !tab.id || !/(^|\.)netflix\.com$/.test(hostOf(tab.url))) {
+  // Everywhere else the click opens the saved-clips library.
+  if (!tab || !tab.id || !needsTabCapture(tab.url)) {
     openLibrary();
     return;
   }

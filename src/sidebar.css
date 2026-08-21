@@ -345,3 +345,40 @@ html.ylr-open #ylr-toggle {
 html.ylr-open .ytp-caption-window-container {
   display: none !important;
 }
+
+.ylr-subbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #1c1c1c;
+  font-size: 12px;
+}
+.ylr-subbar[hidden] {
+  display: none;
+}
+.ylr-subbar-count {
+  color: #888;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ylr-subbar-dl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.ylr-subbar-label {
+  color: #888;
+}
+.ylr-subbar-dl .ylr-link {
+  font-size: 12px;
+  padding: 2px 5px;
+  border: 1px solid #2f2f2f;
+  border-radius: 4px;
+}
+.ylr-subbar-dl .ylr-link:hover {
+  background: #1f1f1f;
+}

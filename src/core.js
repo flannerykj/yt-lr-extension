@@ -15,7 +15,9 @@
     track: null,
     activeIndex: -1,
     starred: new Set(),
-    savedRanges: [] // every saved clip's span, for marking the words in the list
+    savedRanges: [], // every saved clip's span, for marking the words in the list
+    translationLang: "en",
+    translationName: "English"
   };
 
   let capture = null;
@@ -62,6 +64,12 @@
     if (payload.mediaId && payload.mediaId !== adapter.currentMediaId()) return;
     if (state.track && state.track.languageCode !== payload.lang) return;
     state.translation = payload.cues || [];
+    state.translationLang = payload.targetLang || "en";
+    state.translationName =
+      payload.targetName ||
+      (adapter.translationLabel && adapter.translationLabel()) ||
+      "English";
+    updateSubBar();
   }
 
   // Target-language text overlapping a segment's time range. Cues share the
@@ -122,6 +130,15 @@
           <button class="ylr-icon ylr-close" title="Hide">✕</button>
         </div>
       </div>
+      <div class="ylr-subbar" hidden>
+        <span class="ylr-subbar-count"></span>
+        <span class="ylr-subbar-dl">
+          <span class="ylr-subbar-label">Download all</span>
+          <button class="ylr-link" data-fmt="txt">TXT</button>
+          <button class="ylr-link" data-fmt="srt">SRT</button>
+          <button class="ylr-link" data-fmt="json">JSON</button>
+        </span>
+      </div>
       <div class="ylr-body">
         <div class="ylr-list" data-panel="subs"></div>
         <div class="ylr-saved" data-panel="saved" hidden></div>
@@ -159,6 +176,8 @@
       audio: root.querySelector(".ylr-audio"),
       lang: root.querySelector(".ylr-lang"),
       body: root.querySelector(".ylr-body"),
+      subbar: root.querySelector(".ylr-subbar"),
+      subbarCount: root.querySelector(".ylr-subbar-count"),
       list: root.querySelector('[data-panel="subs"]'),
       saved: root.querySelector('[data-panel="saved"]'),
       jump: root.querySelector(".ylr-jump"),
@@ -169,6 +188,9 @@
       menuSave: menu.querySelector(".ylr-menu-save")
     };
     els.jump.addEventListener("click", jumpToActive);
+    els.subbar.querySelectorAll("[data-fmt]").forEach((b) =>
+      b.addEventListener("click", () => downloadTranscript(b.dataset.fmt, b))
+    );
     els.menuSave.addEventListener("click", onMenuSave);
     menu.querySelector(".ylr-menu-close").addEventListener("click", hideMenu);
     // On document so a drag that ends on the row padding still counts, but only
@@ -182,14 +204,15 @@
     root.addEventListener("wheel", () => noteInteraction(2000), { passive: true });
     requestAnimationFrame(paintWord);
 
-    // The mic pill is only meaningful where audio needs enabling (Netflix); the
-    // element tap on YouTube just works on first star.
-    if (adapter.name !== "netflix") els.audio.style.display = "none";
+    // The mic pill is only meaningful where audio needs enabling (the DRM sites,
+    // which expose audioEnabled); the element tap on YouTube just works on first
+    // star.
+    if (!adapter.audioEnabled) els.audio.style.display = "none";
     els.audio.addEventListener("click", () => {
       if (!audioReady)
         alert(
-          "To save audio on Netflix, click this extension's icon in the Chrome " +
-            "toolbar once — that enables tab-audio capture for this tab. Then star a line."
+          "To save audio here, click this extension's icon in the Chrome toolbar " +
+            "once — that enables tab-audio capture for this tab. Then star a line."
         );
     });
     updateAudioStatus();
@@ -238,6 +261,7 @@
     } else {
       els.body.scrollTop = scrollPos.subs || 0;
     }
+    updateSubBar();
     updateJumpButtons();
   }
 
@@ -336,6 +360,7 @@
     els.jump.hidden = true;
     hideMenu();
     painted = { seg: -1, word: -1 };
+    updateSubBar();
     if (!state.segments.length) {
       els.list.innerHTML = '<div class="ylr-note">No subtitles found.</div>';
       return;
@@ -392,6 +417,143 @@
     });
     els.list.innerHTML = "";
     els.list.appendChild(frag);
+  }
+
+  // ---- whole-track download ----
+
+  // The Saved tab exports what you starred; this exports the entire subtitle
+  // track for what you're watching — every line, with its translation beside it.
+  function updateSubBar() {
+    if (!els) return;
+    const on = activeTab === "subs" && state.segments.length > 0;
+    els.subbar.hidden = !on;
+    if (!on) return;
+    const src = state.track ? adapter.trackLabel(state.track) : "";
+    const tr = state.translation.length ? " → " + state.translationName : "";
+    els.subbarCount.textContent = state.segments.length + " lines · " + src + tr;
+  }
+
+  function transcriptRows() {
+    return state.segments.map((seg) => ({
+      start: seg.start,
+      end: seg.end,
+      text: seg.text,
+      translation: translationFor(seg)
+    }));
+  }
+
+  function stamp(seconds, msSep) {
+    const total = Math.max(0, Math.round((seconds || 0) * 1000));
+    const ms = total % 1000;
+    const whole = (total - ms) / 1000;
+    const h = Math.floor(whole / 3600);
+    const m = Math.floor((whole % 3600) / 60);
+    const sec = whole % 60;
+    return (
+      String(h).padStart(2, "0") +
+      ":" +
+      String(m).padStart(2, "0") +
+      ":" +
+      String(sec).padStart(2, "0") +
+      msSep +
+      String(ms).padStart(3, "0")
+    );
+  }
+
+  function transcriptHeader() {
+    return [
+      state.title,
+      "Source: " + (state.track ? adapter.trackLabel(state.track) : "unknown"),
+      "Translation: " +
+        (state.translation.length ? state.translationName : "none loaded"),
+      adapter.clipUrl({ start: 0, end: 0 }),
+      "Exported " + new Date().toLocaleString()
+    ];
+  }
+
+  function buildTxt(rows) {
+    const out = transcriptHeader().map((l) => "# " + l);
+    out.push("");
+    for (const r of rows) {
+      out.push("[" + stamp(r.start, ".") + " --> " + stamp(r.end, ".") + "]");
+      out.push(r.text);
+      if (r.translation) out.push(r.translation);
+      out.push("");
+    }
+    return out.join("\n");
+  }
+
+  // Both languages in one cue, source first — the shape every player and most
+  // flashcard importers already understand.
+  function buildSrt(rows) {
+    const out = [];
+    rows.forEach((r, i) => {
+      out.push(String(i + 1));
+      out.push(stamp(r.start, ",") + " --> " + stamp(r.end, ","));
+      out.push(r.text);
+      if (r.translation) out.push(r.translation);
+      out.push("");
+    });
+    return out.join("\n");
+  }
+
+  function buildJson(rows) {
+    return JSON.stringify(
+      {
+        title: state.title,
+        site: adapter.name,
+        mediaId: adapter.currentMediaId(),
+        url: adapter.clipUrl({ start: 0, end: 0 }),
+        source: state.track
+          ? { languageCode: state.track.languageCode, name: adapter.trackLabel(state.track) }
+          : null,
+        translation: state.translation.length
+          ? { languageCode: state.translationLang, name: state.translationName }
+          : null,
+        exportedAt: new Date().toISOString(),
+        cues: rows
+      },
+      null,
+      2
+    );
+  }
+
+  const FORMATS = {
+    txt: { build: buildTxt, mime: "text/plain", ext: "txt" },
+    srt: { build: buildSrt, mime: "application/x-subrip", ext: "srt" },
+    json: { build: buildJson, mime: "application/json", ext: "json" }
+  };
+
+  function downloadFile(name, blob) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a); // detached anchors don't always download
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+
+  function downloadTranscript(fmt, btn) {
+    const spec = FORMATS[fmt];
+    if (!spec || !state.segments.length) return;
+    const label = btn.textContent;
+    try {
+      const rows = transcriptRows();
+      const name =
+        safeName(state.title || "subtitles") +
+        (state.track ? "." + state.track.languageCode : "") +
+        "." +
+        spec.ext;
+      downloadFile(name, new Blob([spec.build(rows)], { type: spec.mime + ";charset=utf-8" }));
+      btn.textContent = "✓";
+      setTimeout(() => (btn.textContent = label), 1200);
+    } catch (e) {
+      console.log("[YLR] transcript export failed:", e.message);
+      alert("Couldn't export the subtitles: " + e.message);
+      btn.textContent = label;
+    }
   }
 
   // ---- playback sync ----

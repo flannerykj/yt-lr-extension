@@ -5,7 +5,12 @@
 // have separate origins and therefore separate databases: both get pulled.
 (function () {
   const CHUNK = 4;
-  const SITES = ["*://www.youtube.com/*", "*://www.netflix.com/*"];
+  const SITES = [
+    "*://www.youtube.com/*",
+    "*://www.netflix.com/*",
+    "*://www.primevideo.com/*",
+    "*://www.amazon.com/gp/video/*"
+  ];
 
   const style = document.createElement("style");
   style.textContent = window.YLRView.CSS;
