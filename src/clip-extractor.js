@@ -87,13 +87,15 @@
 
     // Primary path: the player's own audio segments, decoded and cut. Instant,
     // and it doesn't care where the playhead is.
-    async extractFromSegments(start, end, pad) {
-      const res = await this.adapter.audioSegments(start - pad, end + pad);
+    async extractFromSegments(start, end) {
+      const pad = NS.CLIP_PAD;
+      const from0 = Math.max(0, start - pad.lead);
+      const res = await this.adapter.audioSegments(from0, end + pad.tail);
       const ctx = this._decodeCtx || (this._decodeCtx = new AudioContext());
       const audio = await ctx.decodeAudioData(res.buffer);
       const rate = audio.sampleRate;
-      const from = Math.max(0, Math.round((start - pad - res.t0) * rate));
-      const to = Math.min(audio.length, Math.round((end + pad - res.t0) * rate));
+      const from = Math.max(0, Math.round((from0 - res.t0) * rate));
+      const to = Math.min(audio.length, Math.round((end + pad.tail - res.t0) * rate));
       if (to - from < rate * 0.05)
         throw new Error("decoded audio didn't cover that line (t0 " + res.t0.toFixed(2) + ")");
       const mono = new Float32Array(to - from);
@@ -120,7 +122,7 @@
       let segErr = null;
       if (this.adapter.audioSegments) {
         try {
-          return await this.extractFromSegments(start, end, 0.15);
+          return await this.extractFromSegments(start, end);
         } catch (e) {
           segErr = e;
           console.log("[YLR] segment extraction failed:", e.message);
@@ -145,7 +147,7 @@
       await this._preparing;
       this.cap.reset();
       this.cap.resume();
-      this.el.currentTime = Math.max(0, start - 0.4);
+      this.el.currentTime = Math.max(0, start - NS.CLIP_PAD.lead - 0.4);
       try {
         await this.el.play();
       } catch (e) {

@@ -14,7 +14,8 @@
     translation: [], // cue-level target language, for hover
     track: null,
     activeIndex: -1,
-    starred: new Set()
+    starred: new Set(),
+    savedRanges: [] // every saved clip's span, for marking the words in the list
   };
 
   let capture = null;
@@ -93,6 +94,7 @@
       state.segments = segments || [];
       state.activeIndex = -1;
       renderSegments();
+      loadSavedRanges();
     } catch (e) {
       if (els)
         els.list.innerHTML =
@@ -267,6 +269,57 @@
     return seg._words;
   }
 
+  // A word counts as saved when its midpoint sits inside a saved clip, so a
+  // clip's lead-in padding doesn't drag the preceding word into the highlight.
+  function isWordSaved(word) {
+    const mid = (word.start + word.end) / 2;
+    for (const r of state.savedRanges) {
+      if (mid >= r.start - 0.05 && mid <= r.end + 0.05) return true;
+    }
+    return false;
+  }
+
+  function markSaved(range) {
+    state.savedRanges.push({ start: range.start, end: range.end });
+    if (!els) return;
+    state.segments.forEach((seg, si) => {
+      if (seg.end < range.start - 0.05 || seg.start > range.end + 0.05) return;
+      wordsOf(seg).forEach((w, wi) => {
+        if (!isWordSaved(w)) return;
+        const span = els.list.querySelector(`.ylr-w[data-seg="${si}"][data-word="${wi}"]`);
+        if (span) span.classList.add("ylr-w-saved");
+      });
+    });
+  }
+
+  // Highlights survive reloads and track switches: rebuild the ranges from the
+  // clips already in the database for this video.
+  async function loadSavedRanges() {
+    const id = adapter.currentMediaId();
+    if (!id) return;
+    let clips;
+    try {
+      clips = await NS.db.all();
+    } catch (e) {
+      console.log("[YLR] could not read saved clips:", e.message);
+      return;
+    }
+    if (adapter.currentMediaId() !== id) return;
+    state.savedRanges = [];
+    state.starred = new Set();
+    for (const c of clips) {
+      if (c.videoId !== id || typeof c.start !== "number") continue;
+      state.savedRanges.push({ start: c.start, end: c.end });
+      // ★ means the whole line was saved — a selection that merely begins at the
+      // same moment shouldn't light it up.
+      const seg = state.segments.find(
+        (s) => Math.abs(s.start - c.start) < 0.05 && Math.abs(s.end - c.end) < 0.05
+      );
+      if (seg) state.starred.add(seg.start);
+    }
+    renderSegments();
+  }
+
   function spaceBetween(prev, next) {
     return !!prev && !!next && !NS.isCJK(prev[prev.length - 1]) && !NS.isCJK(next[0]);
   }
@@ -309,7 +362,7 @@
         if (wi && spaceBetween(words[wi - 1].text, w.text))
           text.appendChild(document.createTextNode(" "));
         const span = document.createElement("span");
-        span.className = "ylr-w";
+        span.className = isWordSaved(w) ? "ylr-w ylr-w-saved" : "ylr-w";
         span.textContent = w.text;
         span.dataset.seg = i;
         span.dataset.word = wi;
@@ -769,6 +822,7 @@
     };
     await NS.db.add(record);
     console.log("[YLR] saved", record.id);
+    markSaved(range);
     return record;
   }
 
@@ -844,9 +898,8 @@
       del.textContent = "Delete";
       del.addEventListener("click", async () => {
         await NS.db.remove(clip.id);
-        state.starred.delete(clip.start);
         card.remove();
-        renderSegments();
+        await loadSavedRanges(); // re-renders with the highlight gone
         tick();
       });
 
@@ -952,6 +1005,7 @@
       state.segments = [];
       state.translation = [];
       state.starred = new Set();
+      state.savedRanges = [];
     }
     boot();
   });

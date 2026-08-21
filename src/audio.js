@@ -6,6 +6,11 @@
 (function () {
   const NS = (window.YLR = window.YLR || {});
 
+  // Subtitle start times land right on the first syllable, so a clip cut at the
+  // exact timestamp clips the attack. Lead in by a second; the tail only needs
+  // enough to avoid chopping the last word.
+  const PAD = { lead: 1.0, tail: 0.15 };
+
   function encodeWav(samples, sampleRate) {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
     const view = new DataView(buffer);
@@ -229,9 +234,9 @@
     // Resolves with a WAV Blob for [start,end]. If not yet buffered (a segment
     // ahead of playback), the promise stays pending and is fulfilled once the
     // buffer fills — the caller is expected to seek/play to make that happen.
-    capture(start, end, { pad = 0.15, waitForPlayback = false, immediate = false } = {}) {
-      const s = Math.max(0, start - pad);
-      const e = end + pad;
+    capture(start, end, { waitForPlayback = false, immediate = false } = {}) {
+      const s = Math.max(0, start - PAD.lead);
+      const e = end + PAD.tail;
       return new Promise((resolve, reject) => {
         if (this._covered(s, e)) {
           const wav = this._slice(s, e);
@@ -338,4 +343,5 @@
 
   NS.AudioCapture = AudioCapture;
   NS.encodeWav = encodeWav;
+  NS.CLIP_PAD = PAD;
 })();
