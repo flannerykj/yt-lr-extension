@@ -131,28 +131,17 @@ seeking to a time outside the media stalls playback outright — so playback sta
 first and the origin is taken from the first audio that actually arrives. That one
 value doubles as proof the codec is really being decoded, which `canPlayType`
 only claims. That runs at 1x and so costs the
-length of the clip, but it is silent and never touches your player. If even that
-is refused, clips fall back to tab capture (`replayable`), which needs the
-toolbar-icon click.
+length of the clip, but it is silent and never touches your player.
 
-If the audio ever comes back encrypted (an `enca`/`sinf` box), the sidebar says
-so and falls back to the tab-capture path below.
+If the audio ever comes back encrypted (an `enca`/`sinf` box), or the codec can be
+neither remuxed nor played, the sidebar says so and the line saves as text.
 
-### Prime Video audio: one extra step
+### Prime Video: subtitles only
 Prime encrypts audio and video together, so it can't be tapped from the video
-element like YouTube, nor fetched like Netflix. Instead we record the **tab's
-audio output** via `chrome.tabCapture`.
-To turn that on: **click the extension's toolbar icon once** while on that tab
-(this is the gesture Chrome requires — nothing inside the page can grant it). A
-banner in the sidebar says so until you do; the 🎙 pill shows the state after
-that. Subtitles, seeking, translation and the whole-track download need no click.
-
-Once it's on, starring behaves like YouTube's: a line you have just heard is
-already in the rolling buffer and saves instantly. A line that hasn't played, or
-one that has scrolled out of the ~90-second buffer, is **replayed** — the player
-jumps back, records the line as it goes past, and returns the playhead. You hear
-that happen; there is no way around it, because the only readable copy of DRM'd
-audio is the one coming out of the speakers.
+element like YouTube, nor fetched like Netflix. Starring a line there saves its
+text, translation and timings, and the Saved tab says why there is no audio.
+Everything else works: subtitles, translation, search, seeking, the whole-track
+download, and the ad-drift correction above.
 
 ## Documentation
 
@@ -203,17 +192,14 @@ supplies tracks, captions, seeking, and the audio source.
   all go through the offset.
 - **Clip audio, in order of preference**: fetch and decode directly (YouTube's own
   segments; Netflix's unencrypted audio streams via `mp4.js`) → slice out of the
-  live ring buffer if the tap is already running → play the range again and record
-  it (`replayable`, Prime only). Sites in the first group never need tab capture.
+  live ring buffer, where the `<video>` element can be tapped. A site with neither
+  saves the line's text and records the reason.
 - **Audio clips**: `pcm-worklet.js` streams PCM into a ~90-second rolling ring
-  buffer (`audio.js`). On YouTube the source is the `<video>` element; on Netflix
-  and Prime Video it's the tabCapture stream. Starring slices `[start,end]` out of
-  the buffer and encodes a WAV — no re-download. Ranges the buffer doesn't hold
-  fall back per site: YouTube decodes the player's own audio segments
-  (`clip-extractor.js`), while a `replayable` adapter (Prime) plays the range
-  again and records it live, then restores the playhead and the paused state.
-  Buffer slices are taken in *player* time, so the ad-drift offset is applied
-  there too.
+  buffer (`audio.js`) over the `<video>` element, where one can be tapped —
+  YouTube only. Starring slices `[start,end]` out of the buffer and encodes a WAV,
+  with no re-download. Ranges the buffer doesn't hold are decoded from the
+  player's own audio segments instead (`clip-extractor.js`). Buffer slices are
+  taken in *player* time, so the ad-drift offset is applied there too.
 - **Storage**: clips (text, WAV, timings, source URL) go into IndexedDB; the
   **Saved** tab lists them with a player, download, and delete. Audio is optional:
   if every capture route fails the line is still saved with its text, translation
@@ -222,17 +208,18 @@ supplies tracks, captions, seeking, and the audio source.
 
 ## Known limitations / caveats
 
-- **Prime Video and Netflix require the one-time toolbar-icon click** to enable
-  audio capture (per browser session / tab). Until then, starring shows a hint.
 - **Prime Video subtitle tracks are cue-level** (no per-word timings), so the
   karaoke highlight splits each cue evenly across its words, as on Netflix.
 - **Automatic ad-drift correction needs the player's own subtitles switched on**
   in the same language as the sidebar's track. Without them the sidebar falls back
   to the manual sync controls, which have to be re-set after each ad break.
-- **Prime Video saves audio clips, not video clips** — the WAV path works via
-  tabCapture; there is no video-clip export.
-- **Replay capture is audible and runs at 1x.** Starring a line far from the
-  playhead costs roughly the length of that line, and you hear it play.
+- **Prime Video saves text only.** The element tap is dead (DRM) and the
+  fetch-and-decode route has never been tested there — whether Amazon ships audio
+  unencrypted, as Netflix does, is still an open question. `prime.js` probes the
+  DASH manifest at load and logs the answer (`[YLR] audio probe: …`).
+- **Netflix's hidden-player route runs at 1x** on xHE-AAC-only titles, so a
+  six-second line takes about six seconds to save. It is silent and does not touch
+  your player.
 - **Playback rate**: clips capture what actually played, so starring at 1.5×
   gives a 1.5× clip. Star at normal speed for natural audio.
 - **IndexedDB is under the site origin** (content scripts share the host page's
@@ -248,8 +235,8 @@ supplies tracks, captions, seeking, and the audio source.
   heartbeat. Without that, the sidebar silently swapped to the next episode's
   subtitles at the same point in every episode.
 - **Netflix clip audio depends on the streams staying unencrypted.** If Netflix
-  starts shipping `enca` audio, clips fall back to tab capture and the toolbar
-  click comes back. The console names the box it found.
+  starts shipping `enca` audio, those titles save as text only. The console names
+  the box it found.
 - On Prime, the tracks arrive when the player asks for its playback resources, so
   the sidebar fills in a moment after playback starts (not on the detail page
   alone), and closing the player is noticed within about a second.
@@ -265,7 +252,7 @@ supplies tracks, captions, seeking, and the audio source.
 - Not yet tested end-to-end in a live browser in this environment. Parsers are
   verified against real data and all files pass syntax checks; the most likely
   spots to need a tweak on first run are Netflix's manifest field names, the
-  tabCapture `getUserMedia` step, and the Netflix seek API.
+  and the Netflix seek API.
 
 ## Files
 
@@ -273,8 +260,8 @@ supplies tracks, captions, seeking, and the audio source.
 |------|-------|------|
 | `src/core.js` | isolated | shared sidebar UI, seek, star, Saved tab |
 | `src/youtube.js` | isolated | YouTube adapter (json3 via inject, element audio) |
-| `src/netflix.js` | isolated | Netflix adapter (WebVTT, tabCapture audio) |
-| `src/prime.js` | isolated | Prime Video adapter (TTML/DFXP, tabCapture audio) |
+| `src/netflix.js` | isolated | Netflix adapter (WebVTT/TTML, fetched audio) |
+| `src/prime.js` | isolated | Prime Video adapter (TTML/DFXP, subtitles only) |
 | `src/inject.js` | MAIN | YouTube: drive player, intercept `json3` timedtext |
 | `src/netflix-inject.js` | MAIN | Netflix: manifest `JSON.parse` hook, seek API |
 | `src/prime-inject.js` | MAIN | Prime: playback-resources hook, seek |
@@ -284,4 +271,4 @@ supplies tracks, captions, seeking, and the audio source.
 | `src/db.js` | isolated | IndexedDB for saved clips |
 | `src/settings.js` | isolated | preferences in `chrome.storage.local` |
 | `src/mp4.js` | isolated | fragmented-MP4 index: time range → byte range |
-| `src/background.js` | service worker | toolbar click → tabCapture streamId |
+| `src/background.js` | service worker | cross-origin fetches, toolbar click → library |

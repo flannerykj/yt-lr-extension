@@ -1,13 +1,14 @@
 // Prime Video adapter. Tracks come from prime-inject.js (playback-resources
 // interception); subtitles are plain TTML/WebVTT files on Amazon's CDN, so the
-// adapter just fetches and parses them. Audio, like Netflix, is DRM'd and has
-// to come from chrome.tabCapture.
+// adapter just fetches and parses them.
+//
+// No audio: Prime encrypts audio together with video, so there is nothing to tap
+// and nothing fetchable to decode. Starring a line here saves its text.
 (function () {
   const NS = (window.YLR = window.YLR || {});
   let handlers = null;
   let tracks = [];
   let mediaId = null;
-  let captureStream = null;
   let translationTrack = null;
 
   // Cached because core polls this every animation frame; Prime only swaps the
@@ -96,6 +97,8 @@
     tracks = ev.data.tracks || [];
     mediaId = ev.data.mediaId;
     announceTracks(ev.data, 0);
+    // The media urls arrive in a later response than the subtitles, so the first
+    // PV_TRACKS usually carries none and a second one carries them.
     probeAudio(ev.data.manifests || []);
   }
 
@@ -111,6 +114,7 @@
   async function probeAudio(manifests) {
     if (probed || !manifests.length) return;
     probed = true;
+    console.log("[YLR] probing", manifests.length, "media manifest(s) for fetchable audio");
     for (const url of manifests) {
       try {
         const body = await fetchText(url);
@@ -250,39 +254,13 @@
     }, 1000);
   }
 
-  function setupCaptureBridge() {
-    chrome.runtime.onMessage.addListener((msg) => {
-      if (!msg || msg.type !== "ENABLE_CAPTURE") return;
-      if (!msg.streamId) {
-        alert("Audio capture couldn't start: " + (msg.error || "unknown error"));
-        return;
-      }
-      navigator.mediaDevices
-        .getUserMedia({
-          audio: {
-            mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: msg.streamId }
-          },
-          video: false
-        })
-        .then((stream) => {
-          captureStream = stream;
-          if (handlers && handlers.onCaptureStream) handlers.onCaptureStream(stream);
-        })
-        .catch((e) => {
-          console.log("[YLR] getUserMedia(tab) FAILED:", e.name, "-", e.message);
-          alert("Audio capture failed (" + e.name + "): " + e.message);
-        });
-    });
-  }
+
 
   NS.adapter = {
     name: "prime",
     // Ad breaks are stitched into the timeline video.currentTime reports, so the
     // sidebar has to re-anchor itself against the player's own captions.
     syncable: true,
-    // No decodable second source behind the DRM, so an unbuffered line is
-    // captured by playing it again.
-    replayable: true,
     playerRoot() {
       return (
         document.querySelector("#dv-web-player") ||
@@ -335,7 +313,6 @@
     init(h) {
       handlers = h;
       window.addEventListener("message", onMessage);
-      setupCaptureBridge();
     },
     requestTracks() {
       window.postMessage({ source: "YLR-CS", type: "PV_REQUEST_TRACKS" }, "*");
@@ -345,25 +322,8 @@
       loadTranslation(track);
       return segments;
     },
-    async setupAudio(capture) {
-      if (captureStream) {
-        const t = captureStream.getAudioTracks()[0];
-        if (!t || t.readyState === "ended") captureStream = null;
-      }
-      if (!captureStream)
-        throw new Error(
-          "Audio capture isn't on. Click this extension's icon in the Chrome toolbar " +
-            "once to enable it for this tab, then star again."
-        );
-      await capture.ensureFromStream(captureStream);
-    },
-    audioEnabled() {
-      const t = captureStream && captureStream.getAudioTracks()[0];
-      return !!(t && t.readyState === "live");
-    },
-    resetAudio() {
-      if (captureStream) captureStream.getTracks().forEach((t) => t.stop());
-      captureStream = null;
-    }
+
+
+
   };
 })();

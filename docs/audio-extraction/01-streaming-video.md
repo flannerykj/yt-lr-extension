@@ -1,16 +1,11 @@
 # How streaming video actually loads
 
-Background for everything else in this folder. If you know how a `<video>` tag
-gets its bytes on YouTube or Netflix, skip to
-[02-getting-audio.md](02-getting-audio.md).
+## how a `<video>` tag gets its bytes on YouTube or Netflix: 
 
-## It is not a file download
-
-The intuition from scripting is: `GET some.mp4`, get a file, decode it. Streaming
-video does not work that way. A `<video>` element on Netflix or YouTube is never
+A `<video>` element on Netflix or YouTube is never
 given a URL at all.
 
-Instead, JavaScript running on the page:
+JavaScript running on the page:
 
 1. Fetches a **manifest** — a JSON or XML document listing every available track:
    video at half a dozen qualities, audio per language and per codec, subtitles

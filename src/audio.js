@@ -1,5 +1,5 @@
-// Rolling PCM ring buffer over the YouTube <video>, plus WAV export of any
-// past time range. Each PCM batch from the worklet is tagged with the video's
+// Rolling PCM ring buffer over a <video> or <audio> element, plus WAV export of
+// any past time range. Each PCM batch from the worklet is tagged with the video's
 // currentTime at receipt, so a starred phrase is sliced by matching video-time
 // tags rather than wall-clock — correct across pauses and (approximately)
 // playback-rate changes.
@@ -107,27 +107,6 @@
           "[YLR] element tap connected" + (silent ? " (silent)" : "") + "; ctx state:",
           this.ctx.state
         );
-      })();
-      return this._ensuring;
-    }
-
-    // Netflix: DRM blocks the element tap, so we record the tab's rendered
-    // output (a MediaStream from tabCapture). The tab is already audible, so the
-    // worklet's passthrough is routed through a muted gain to avoid doubling it.
-    ensureFromStream(stream) {
-      if (this.ready) return Promise.resolve();
-      if (this._ensuring) return this._ensuring;
-      this._ensuring = (async () => {
-        this.captureStream = stream; // keep a ref so it isn't garbage-collected
-        await this._init();
-        const source = this.ctx.createMediaStreamSource(stream);
-        const mute = this.ctx.createGain();
-        mute.gain.value = 0;
-        source.connect(this.node);
-        this.node.connect(mute);
-        mute.connect(this.ctx.destination);
-        this.ready = true;
-        console.log("[YLR] stream tap connected; ctx state:", this.ctx.state);
       })();
       return this._ensuring;
     }

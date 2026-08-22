@@ -3,7 +3,7 @@
   "name": "YouTube Language Sidebar",
   "version": "0.4.0",
   "description": "Language-Reactor-style subtitle sidebar for YouTube, Netflix and Prime Video. Star a phrase to save its text and a real audio clip of that exact time range.",
-  "permissions": ["storage", "tabCapture"],
+  "permissions": ["storage"],
   "host_permissions": [
     "*://*.youtube.com/*",
     "*://*.netflix.com/*",
@@ -16,7 +16,7 @@
     "*://*.aiv-delivery.net/*",
     "*://*.cloudfront.net/*"
   ],
-  "action": { "default_title": "Saved clips library (Netflix/Prime: enable audio capture)" },
+  "action": { "default_title": "Saved clips library" },
   "background": { "service_worker": "src/background.js" },
   "content_scripts": [
     {

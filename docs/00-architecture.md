@@ -34,7 +34,7 @@ manifest decides which adapter file is injected, and that is the whole mechanism
                                   chrome.runtime.sendMessage
                     ┌──────────────────────────┴──────────────────────────────┐
                     │            background.js (service worker)                │
-                    │  tabCapture gesture · cross-origin fetches               │
+                    │  cross-origin fetches · toolbar click → library          │
                     └──────────────────────────────────────────────────────────┘
 ```
 
@@ -42,6 +42,22 @@ manifest decides which adapter file is injected, and that is the whole mechanism
 
 Chrome runs content scripts in an **isolated world**: a separate JavaScript realm
 that shares the DOM with the page but has its own globals. This matters constantly.
+
+
+                 YouTube
+                    │
+          ┌─────────┴─────  ────┐
+          │                     │
+       MAIN world            ISOLATED world
+          │                     │
+    page's JS objects        chrome.runtime
+hook `JSON.parse` / `fetch  `chrome.storage
+          │                     │
+          └── postMessage   -───┘
+
+Both: 
+- Access shared instance of DOM
+- Have their OWN instance of window.YLR 
 
 |  | MAIN world | ISOLATED world |
 |---|---|---|
@@ -131,17 +147,14 @@ Everything below is read off `NS.adapter` by `core.js`.
 | `init(handlers)` | | Wire up; see handlers below |
 | `requestTracks()` | | Ask the injector to (re-)publish its tracks |
 | `loadTrack(track)` | → `Promise<segment[]>` | Fetch and parse a track. A segment is `{start, end, text, words?}` in seconds |
-| `setupAudio(capture)` | → `Promise` | Attach an `AudioCapture` to this site's audio source, or throw with a message the user can act on |
 
 ### Optional — presence is the feature flag
 
 | Member | Meaning if present |
 |---|---|
-| `audioSegments(start, end)` | Can fetch and decode audio directly. Returns `{buffer, t0, fallbackBuffer?, playbackOnly?, mime?, describe?}`. **Enables the fetch route and suppresses the tab-capture banner** |
-| `audioSource()` / `audioBytes()` | An audio-only stream URL / its bytes, for the replay extractor (YouTube) |
-| `audioEnabled()` | → bool. This site uses tab capture, and this is whether it has been granted |
-| `resetAudio()` | Drop a dead capture stream |
-| `replayable` | `true` = may seek the user's player to re-record a range |
+| `setupAudio(capture)` | Can hand us a tappable media element. Absent on DRM sites, where there is nothing to tap |
+| `audioSegments(start, end)` | Can fetch and decode audio directly. Returns `{buffer, t0, fallbackBuffer?, playbackOnly?, mime?, describe?}`. **Enables the fetch route** |
+| `audioSource()` / `audioBytes()` | An audio-only stream URL / its bytes, for the hidden-player extractor (YouTube) |
 | `syncable` | `true` = the timeline drifts (ads) and needs caption-anchored correction |
 | `playerRoot()` | The player container: narrowed by push mode, and scanned for the caption overlay |
 | `currentTitle()` | Freshest title, asked for at download time |
@@ -153,7 +166,6 @@ Everything below is read off `NS.adapter` by `core.js`.
 | member | kind | youtube | netflix | prime |
 |---|---|---|---|---|
 | `audioBytes` | fn | yes | — | — |
-| `audioEnabled` | fn | — | yes | yes |
 | `audioSegments` | fn | yes | yes | — |
 | `audioSource` | fn | yes | — | — |
 | `clipUrl` | fn | yes | yes | yes |
@@ -168,24 +180,21 @@ Everything below is read off `NS.adapter` by `core.js`.
 | `name` | string | yes | yes | yes |
 | `onNavigate` | fn | yes | yes | yes |
 | `playerRoot` | fn | — | yes | yes |
-| `replayable` | boolean | — | yes | yes |
 | `requestTracks` | fn | yes | yes | yes |
-| `resetAudio` | fn | — | yes | yes |
 | `seek` | fn | yes | yes | yes |
-| `setupAudio` | fn | yes | yes | yes |
+| `setupAudio` | fn | yes | — | — |
 | `syncable` | boolean | — | — | yes |
 | `trackLabel` | fn | yes | yes | yes |
 | `translationLabel` | fn | — | — | yes |
 
 ### Handlers — the callbacks core hands back
 
-`adapter.init({ onTracks, onTranslation, onCaptureStream })`
+`adapter.init({ onTracks, onTranslation })`
 
 | Handler | Payload | When |
 |---|---|---|
 | `onTracks` | `{tracks, mediaId, title}` | The injector found subtitle tracks. Creates the sidebar if the player is up, and selects a track when the media is new |
 | `onTranslation` | `{mediaId, lang, cues, targetLang?, targetName?}` | The translation track parsed. `lang` is the **source** language, for staleness checks |
-| `onCaptureStream` | `MediaStream` | tabCapture was granted; start filling the ring buffer |
 
 ## Message types
 
@@ -217,14 +226,12 @@ also check `ev.source !== window`.
 
 | Type | Direction | Purpose |
 |---|---|---|
-| `ENABLE_CAPTURE` | worker → CS | `{streamId}` or `{error}` after the toolbar click |
 | `YLR_FETCH_TEXT` | CS → worker | `{url}` → `{ok, text}`. Subtitle files when the CDN refuses the page origin |
 | `YLR_FETCH_BYTES` | CS → worker | `{url, from, to}` → `{ok, body}` base64. Audio ranges, same reason |
 | `YLR_LIBRARY_PULL` | library page → CS | `{from, count}` → clips. IndexedDB is per-origin, so the extension page has to ask a content script for them |
 
-The worker also owns the `chrome.action.onClicked` gesture: on a site that needs
-tab capture it calls `chrome.tabCapture.getMediaStreamId` and sends the id to the
-tab; everywhere else it opens the saved-clips library.
+The worker also handles `chrome.action.onClicked`, which opens the saved-clips
+library.
 
 ## Lifecycle
 

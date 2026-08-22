@@ -42,16 +42,12 @@
   let filterShown = 0;
   let inPlayer = false;
   let wordHighlight = false; // karaoke highlight, off unless switched on
-  let lastAudioOk = null;
-  let audioNoteDismissed = false;
   let pushPage = true; // narrow the page instead of covering it
   let hidePlayerCaptions = true; // the sidebar shows the same line
   let resizeTimer = null;
   let verifyTimer = null;
   let pushBroken = false; // this page's layout can't take being narrowed
   let lastLayout = "";
-  let directAudioFailed = false; // fetching the audio outright stopped working
-  let lastDirectError = "";
 
   function video() {
     return adapter.getVideo();
@@ -164,7 +160,6 @@
           <button class="ylr-tab" data-tab="settings">Settings</button>
         </div>
         <div class="ylr-head-right">
-          <button class="ylr-audio" title="Audio capture">🎙</button>
           <select class="ylr-lang" title="Subtitle language"></select>
           <button class="ylr-icon ylr-close" title="Hide">✕</button>
         </div>
@@ -191,10 +186,6 @@
             <button class="ylr-link ylr-sync-reset" title="Go back to following the player's own captions">Auto</button>
           </span>
         </div>
-      </div>
-      <div class="ylr-audio-note" hidden>
-        <span class="ylr-audio-why"></span>
-        <button class="ylr-icon ylr-audio-dismiss" title="Dismiss">✕</button>
       </div>
       <div class="ylr-capture-status" hidden>
         <span class="ylr-capture-text"></span>
@@ -267,11 +258,8 @@
       root,
       toggle,
       tip,
-      audio: root.querySelector(".ylr-audio"),
       lang: root.querySelector(".ylr-lang"),
       body: root.querySelector(".ylr-body"),
-      audioNote: root.querySelector(".ylr-audio-note"),
-      audioWhy: root.querySelector(".ylr-audio-why"),
       captureStatus: root.querySelector(".ylr-capture-status"),
       captureText: root.querySelector(".ylr-capture-text"),
       subbar: root.querySelector(".ylr-subbar"),
@@ -297,11 +285,6 @@
     root.querySelector(".ylr-capture-dismiss").addEventListener("click", () =>
       setCaptureStatus("")
     );
-    // The mic pill still shows the state, so the banner only has to be seen once.
-    root.querySelector(".ylr-audio-dismiss").addEventListener("click", () => {
-      audioNoteDismissed = true;
-      updateAudioStatus();
-    });
     els.search.addEventListener("input", applyFilter);
     els.search.addEventListener("keydown", (e) => {
       if (e.key !== "Escape") return;
@@ -339,19 +322,6 @@
     root.addEventListener("pointermove", () => noteInteraction(1500));
     root.addEventListener("wheel", () => noteInteraction(2000), { passive: true });
     requestAnimationFrame(paintWord);
-
-    // The mic pill is only meaningful where audio needs enabling (the DRM sites,
-    // which expose audioEnabled); the element tap on YouTube just works on first
-    // star.
-    if (!adapter.audioEnabled) els.audio.style.display = "none";
-    els.audio.addEventListener("click", () => {
-      if (!audioReady)
-        alert(
-          "To save audio here, click this extension's icon in the Chrome toolbar " +
-            "once — that enables tab-audio capture for this tab. Then star a line."
-        );
-    });
-    updateAudioStatus();
 
     els.body.addEventListener("scroll", onBodyScroll);
 
@@ -1114,11 +1084,6 @@
       else break;
     }
     if (idx !== state.activeIndex) setActive(idx);
-    const key = audioAvailable() + "|" + (adapter.audioSegments ? directAudioReason() : "");
-    if (key !== lastAudioOk) {
-      lastAudioOk = key;
-      updateAudioStatus();
-    }
   }
 
   // ---- karaoke ----
@@ -1465,42 +1430,6 @@
     if (els) els.tip.hidden = true;
   }
 
-  // YouTube taps the element and needs no permission, so it never reports an
-  // audioEnabled state and never shows the banner.
-  function audioAvailable() {
-    return !adapter.audioEnabled || adapter.audioEnabled();
-  }
-
-  // Why can't this site give us audio right now? The direct fetch is the
-  // preferred route, so if that has failed its reason is the useful one — the
-  // tab-capture advice is only the fallback.
-  function directAudioReason() {
-    const status = adapter.directAudioStatus && adapter.directAudioStatus();
-    if (status && status.probed && !status.ok) return status.reason;
-    return directAudioFailed ? lastDirectError : "";
-  }
-
-  function updateAudioStatus() {
-    if (!els || !els.audio) return;
-    const ok = audioAvailable();
-    const why = adapter.audioSegments ? directAudioReason() : "";
-    els.audio.classList.toggle("ylr-audio-on", ok && audioReady);
-    els.audio.title = ok
-      ? "Audio capture on"
-      : "Audio capture off — click the extension's toolbar icon to enable";
-    els.audioNote.hidden =
-      ok || audioNoteDismissed || !adapter.audioEnabled || (!!adapter.audioSegments && !why);
-    if (els.audioNote.hidden) return;
-    els.audioWhy.textContent = why
-      ? "Couldn't fetch this title's audio: " +
-        why +
-        " — falling back to recording the tab, which needs the extension's " +
-        "toolbar icon clicked once."
-      : "Audio capture is off. This site's audio is DRM-protected, so a clip has " +
-        "to be recorded from the tab — click the extension's icon in the Chrome " +
-        "toolbar once to switch it on.";
-  }
-
   function setCaptureStatus(text) {
     if (!els) return;
     els.captureText.textContent = text || "";
@@ -1509,45 +1438,23 @@
 
   // ---- capture / save ----
 
-  // Called by the adapter when a tab-capture MediaStream becomes available
-  // (Netflix, after the toolbar-icon enable). Starts recording immediately so
-  // the ring buffer is filling as you watch and starring is instant.
-  function onCaptureStream(stream) {
-    console.log("[YLR] core: capture stream received, starting ring buffer");
-    updateAudioStatus();
-    // Granted from the detail page, before playback. Nothing to tag chunks
-    // against yet, so leave the buffer for enterPlayer to start.
-    if (!video()) return;
-    if (!capture) capture = new NS.AudioCapture(video(), { bufferSeconds: 90, liveTime });
-    capture
-      .ensureFromStream(stream)
-      .then(() => {
-        capture.resume();
-        audioReady = true;
-        updateAudioStatus();
-        console.log("[YLR] core: ring buffer recording");
-      })
-      .catch((e) => console.log("[YLR] core: ensureFromStream failed:", e.message));
-  }
-
+  // The live element tap. Only sites that can hand us a media element get one —
+  // where the audio is DRM-protected there is nothing to tap.
   async function ensureCapture() {
+    if (!adapter.setupAudio) throw new Error("this site's audio can't be tapped");
     const v = video();
     if (!v) throw new Error("no video element");
-    // Both sites can swap the <video> element out from under us (SPA nav). Chunks
-    // are time-tagged from capture.video, so a stale ref stops the buffer dead.
-    if (capture && capture.video !== v) {
-      if (capture.captureStream) capture.video = v;
-      else capture = null;
-    }
+    // The <video> can be swapped out from under us on an SPA navigation, and
+    // chunks are time-tagged from capture.video, so a stale ref stops the buffer.
+    if (capture && capture.video !== v) capture = null;
     if (capture && capture.ready) {
       capture.resume();
       return;
     }
-    if (!capture) capture = new NS.AudioCapture(v, { bufferSeconds: 90, liveTime });
+    capture = new NS.AudioCapture(v, { bufferSeconds: 90, liveTime });
     await adapter.setupAudio(capture);
     capture.resume();
     audioReady = true;
-    updateAudioStatus();
   }
 
   function ensureExtractor() {
@@ -1557,94 +1464,41 @@
     return extractor;
   }
 
-  // Three ways to get the audio for a range, in order of preference:
-  //   1. Fetch and decode it directly (YouTube's own segments, Netflix's
-  //      unencrypted audio streams). Instant, needs no permission, doesn't
-  //      disturb playback.
-  //   2. Slice it out of the live ring buffer, if the tap is running and the
-  //      line has already played through it.
-  //   3. Play the range again and record it (DRM sites with no fetchable audio).
+  // Two ways to get the audio for a range:
+  //   1. Fetch and decode it directly — YouTube's own segments, Netflix's
+  //      unencrypted audio streams. Instant, and playhead-independent.
+  //   2. Slice it out of the live ring buffer, where the element can be tapped
+  //      and the line has already played through it.
+  // A site with neither saves the line's text and says so.
   async function clipFor(seg) {
     const start = seg.start + syncOffset;
     const end = seg.end + syncOffset;
     const extractor = ensureExtractor();
     const canFetch = !!(extractor && adapter.audioSegments);
+    const canTap = !!adapter.setupAudio;
     console.log(
       "[YLR] clip " + start.toFixed(1) + "-" + end.toFixed(1) + "s" +
         " | direct fetch: " + (canFetch ? "yes" : "no") +
-        " | live tap: " + (audioReady ? "ready" : "off") +
-        " | replay: " + (adapter.replayable ? "yes" : "no")
+        " | live tap: " + (canTap ? (audioReady ? "ready" : "available") : "no")
     );
+    if (!canFetch && !canTap)
+      throw new Error("this site's audio is protected and can't be captured");
 
-    if (!canFetch || audioReady) {
+    if (canTap && (!canFetch || audioReady)) {
       try {
         await ensureCapture();
-        console.log(
-          "[YLR] star: capturing",
-          start.toFixed(2),
-          "-",
-          end.toFixed(2),
-          "| ctx",
-          capture.ctx && capture.ctx.state
-        );
         return await capture.capture(start, end, { immediate: canFetch });
       } catch (e) {
         console.log("[YLR] live buffer miss:", e.message);
         if (/no audio|cancelled|blocked|tap/i.test(e.message)) {
           capture = null;
           audioReady = false;
-          // A stale element only needs the capture rebuilt. Tearing down the
-          // tab-capture stream as well would cost another toolbar click for
-          // nothing — reserve that for a tap that genuinely carries no audio.
-          if (adapter.resetAudio && !/tap/i.test(e.message)) adapter.resetAudio();
         }
-        if (!extractor && !(adapter.replayable && audioAvailable())) throw e;
+        if (!extractor) throw e;
       }
     }
 
-    if (extractor) {
-      try {
-        return await extractor.extract(adapter.currentMediaId(), start, end);
-      } catch (e) {
-        console.log("[YLR] direct extraction failed:", e.message);
-        directAudioFailed = true;
-        lastDirectError = e.message;
-        updateAudioStatus();
-        if (!(adapter.replayable && audioAvailable())) throw e;
-      }
-    }
-
-    if (adapter.replayable && audioAvailable()) return await replayCapture(seg);
-    throw new Error("no way to capture audio for that line");
-  }
-
-  // Everything the live buffer holds is what has already played through the tap.
-  // On a DRM site there is no second source to decode, so the only way to get a
-  // line that hasn't played (or has scrolled out of the buffer) is to play it:
-  // jump there, record it as it goes past, then put the playhead back.
-  async function replayCapture(range) {
-    await ensureCapture();
-    const v = video();
-    if (!v) throw new Error("the player isn't open");
-    const start = range.start + syncOffset;
-    const end = range.end + syncOffset;
-    const back = v.currentTime;
-    const wasPaused = v.paused;
-    setCaptureStatus(
-      "Replaying " + formatTime(range.start) + "–" + formatTime(range.end) + " to record it…"
-    );
-    capture.reset(); // stale tags must not satisfy the range we're about to fill
-    adapter.seek(Math.max(0, start - NS.CLIP_PAD.lead - 0.5));
-    try {
-      return await capture.capture(start, end, {
-        waitForPlayback: true,
-        label: "tab capture"
-      });
-    } finally {
-      setCaptureStatus("");
-      adapter.seek(back);
-      if (wasPaused) setTimeout(() => v.pause(), 250);
-    }
+    return await extractor.extract(adapter.currentMediaId(), start, end);
   }
 
   // The text, translation and timings are the point; the audio is a bonus. If
@@ -1956,15 +1810,6 @@
     pushBroken = false;
     showPlayerUI();
     if (fresh) resetMedia();
-    // A stream tap survives the player closing, but the element its chunks are
-    // time-tagged against does not.
-    const v = video();
-    if (capture && capture.captureStream && v && capture.video !== v) {
-      capture.video = v;
-      capture.reset();
-    }
-    if (!capture && audioAvailable() && adapter.audioEnabled)
-      ensureCapture().catch((e) => console.log("[YLR] pre-warm audio:", e.message));
     if (!state.segments.length)
       els.list.innerHTML = '<div class="ylr-note">Loading subtitles…</div>';
     applyLayout(); // the player container may only just have appeared
@@ -1998,7 +1843,7 @@
 
   adapter.onNavigate(checkLocation);
 
-  adapter.init({ onTracks, onTranslation, onCaptureStream });
+  adapter.init({ onTracks, onTranslation });
 
   // YouTube can tap the element directly, so start recording on the first user
   // gesture (audio contexts need one). Then the phrase you star has already been
@@ -2017,9 +1862,9 @@
       " on " +
       adapter.name +
       " | direct fetch: " +
-      (NS.ClipExtractor && adapter.audioSegments ? "available" : "no") +
-      " | tab capture: " +
-      (adapter.audioEnabled ? "needs enabling" : "n/a")
+      (NS.ClipExtractor && adapter.audioSegments ? "yes" : "no") +
+      " | live tap: " +
+      (adapter.setupAudio ? "yes" : "no")
   );
 
   checkLocation();

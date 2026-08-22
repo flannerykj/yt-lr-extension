@@ -119,16 +119,6 @@ html.ylr-push.ylr-open #ylr-toggle {
   cursor: pointer;
   font-size: 14px;
 }
-.ylr-audio {
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 14px;
-  filter: grayscale(1) opacity(0.5);
-}
-.ylr-audio.ylr-audio-on {
-  filter: none;
-}
 
 .ylr-body {
   flex: 1;
@@ -503,7 +493,6 @@ html.ylr-hidecc.ylr-open [class*="captions-overlay"] {
   box-shadow: none;
 }
 
-
 #ylr-toggle[hidden] {
   display: none;
 }
@@ -533,18 +522,6 @@ html.ylr-hidecc.ylr-open [class*="captions-overlay"] {
   line-height: 1.45;
 }
 
-.ylr-audio-note {
-  padding: 10px 12px;
-  background: #2a2418;
-  border-bottom: 1px solid #3d3320;
-  color: #e8d9b0;
-  font-size: 12px;
-  line-height: 1.5;
-}
-.ylr-audio-note b,
-.ylr-audio-why {
-  color: #e8d9b0;
-}
 .ylr-capture-status {
   position: relative;
   padding: 7px 30px 7px 12px;
@@ -562,26 +539,13 @@ html.ylr-hidecc.ylr-open [class*="captions-overlay"] {
 }
 /* These two carry the diagnostics, so their text has to be selectable — the
    surrounding sidebar suppresses selection for drag-to-save. */
-.ylr-capture-status,
-.ylr-audio-note {
+.ylr-capture-status {
   user-select: text;
   -webkit-user-select: text;
   cursor: text;
 }
-.ylr-capture-dismiss,
-.ylr-audio-dismiss {
+.ylr-capture-dismiss {
   cursor: pointer;
-}
-
-.ylr-audio-note {
-  position: relative;
-  padding-right: 30px;
-}
-.ylr-audio-dismiss {
-  position: absolute;
-  top: 6px;
-  right: 8px;
-  color: #a1926b;
 }
 
 .ylr-clip-noaudio {

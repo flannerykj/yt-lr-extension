@@ -1,12 +1,12 @@
 // Netflix adapter. Tracks come from netflix-inject.js (manifest interception);
-// subtitles are fetched directly (WebVTT, not DRM'd); audio is captured from the
-// tab's output via chrome.tabCapture (DRM blocks the element tap).
+// subtitles are fetched directly (WebVTT/TTML, not DRM'd), and so is the audio —
+// Netflix ships that unencrypted, so clips are fetched and decoded rather than
+// recorded.
 (function () {
   const NS = (window.YLR = window.YLR || {});
   let handlers = null;
   let tracks = [];
   let mediaId = null;
-  let captureStream = null;
   let audioTracks = [];
   let selectedLang = "";
   const indexCache = new Map(); // stream url -> { init, entries }
@@ -402,49 +402,9 @@
     window.addEventListener("popstate", fire);
   }
 
-  // The background worker sends a tabCapture streamId after the toolbar-icon
-  // click; turn it into a MediaStream and hand it to core to start recording.
-  function setupCaptureBridge() {
-    chrome.runtime.onMessage.addListener((msg) => {
-      if (!msg || msg.type !== "ENABLE_CAPTURE") return;
-      if (!msg.streamId) {
-        console.log("[YLR] ENABLE_CAPTURE error:", msg.error);
-        alert("Audio capture couldn't start: " + (msg.error || "unknown error"));
-        return;
-      }
-      console.log("[YLR] ENABLE_CAPTURE received (streamId len " + String(msg.streamId).length + "); calling getUserMedia…");
-      navigator.mediaDevices
-        .getUserMedia({
-          audio: {
-            mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: msg.streamId }
-          },
-          video: false
-        })
-        .then((stream) => {
-          const at = stream.getAudioTracks()[0];
-          console.log(
-            "[YLR] getUserMedia(tab) OK — track:",
-            at && JSON.stringify(at.label),
-            "| muted:",
-            at && at.muted,
-            "| state:",
-            at && at.readyState
-          );
-          captureStream = stream;
-          if (handlers && handlers.onCaptureStream) handlers.onCaptureStream(stream);
-        })
-        .catch((e) => {
-          console.log("[YLR] getUserMedia(tab) FAILED:", e.name, "-", e.message);
-          alert("Audio capture failed (" + e.name + "): " + e.message);
-        });
-    });
-  }
 
   NS.adapter = {
     name: "netflix",
-    // Last resort when the audio can't be fetched at all: record the tab while
-    // playing the line again, as on Prime Video.
-    replayable: true,
     // The watch page is a full-viewport fixed layout, so push mode has to narrow
     // this container directly rather than relying on the body's width.
     playerRoot() {
@@ -486,7 +446,6 @@
     init(h) {
       handlers = h;
       window.addEventListener("message", onMessage);
-      setupCaptureBridge();
     },
     requestTracks() {
       window.postMessage({ source: "YLR-CS", type: "NF_REQUEST_TRACKS" }, "*");
@@ -512,27 +471,8 @@
       fetchTranslation(track);
       return segments;
     },
-    async setupAudio(capture) {
-      // Drop a dead stream from a previous attempt.
-      if (captureStream) {
-        const t = captureStream.getAudioTracks()[0];
-        if (!t || t.readyState === "ended") captureStream = null;
-      }
-      if (!captureStream) {
-        throw new Error(
-          "Audio capture isn't on. Click this extension's icon in the Chrome toolbar " +
-            "once to enable it for this tab, then star again."
-        );
-      }
-      await capture.ensureFromStream(captureStream);
-    },
-    audioEnabled() {
-      const t = captureStream && captureStream.getAudioTracks()[0];
-      return !!(t && t.readyState === "live");
-    },
-    resetAudio() {
-      if (captureStream) captureStream.getTracks().forEach((t) => t.stop());
-      captureStream = null;
-    }
+
+
+
   };
 })();

@@ -189,5 +189,10 @@ exactly that.
 ## Why this does not rescue Netflix
 
 The buffer only ever holds what came through the tap. On Netflix the element tap
-yields silence, so unless tab capture is enabled the buffer is empty and there is
-nothing to slice. That is the whole reason for the fetch-and-decode road.
+yields silence, so there is nothing to slice — the adapter has no `setupAudio` at
+all. That is the whole reason for the fetch-and-decode road.
+
+The same machinery is reused there, though: the hidden-player route in
+`clip-extractor.js` builds its own `AudioCapture` over an `<audio>` element
+holding fetched bytes, so it lands in the same `_covered` / `_slice` /
+`encodeWav` path.

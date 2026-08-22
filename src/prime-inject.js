@@ -4,7 +4,7 @@
 // deep-scan anything that looks like that document, and post the tracks to the
 // content script. Also handles seeking.
 (function () {
-  console.log("[YLR] prime-inject loaded — build 15");
+  console.log("[YLR] prime-inject loaded — build 16");
   const origParse = JSON.parse;
   const originalFetch = window.fetch;
   let cached = null; // { tracks, mediaId, title }
@@ -131,35 +131,64 @@
     return m ? m[1] : location.pathname;
   }
 
-  // Prime's playback resources also point at the DASH manifests for the feature
+  // Prime's playback resources point at the DASH manifests for the feature
   // itself. Whether the *audio* adaptation set inside them is encrypted decides
-  // whether clips can be fetched and decoded directly, the way Language Reactor
-  // does it on Netflix, instead of recorded off the speakers.
-  function collectManifests(node) {
+  // whether clips can be fetched and decoded directly, the way it is done on
+  // Netflix — an open question, because nothing has read one yet.
+  //
+  // Prime asks for its resources in several calls with different
+  // `desiredResources`, so the response carrying the subtitles is usually NOT the
+  // one carrying the media. These are therefore collected from every response,
+  // independently of the subtitle handling, and matched on the *key* they sit
+  // under rather than on a file extension the URLs may not have.
+  const MEDIA_KEYS = /audioVideoUrls|avCdnUrlSets|cdnUrlSets|urlSets|playbackUrls|manifestUrls|streamingUrls/i;
+  let mediaUrls = [];
+  let shapeLogged = false;
+
+  function collectMediaUrls(root) {
     const urls = [];
     const seen = new Set();
-    const walk = (n, depth) => {
-      if (!n || typeof n !== "object" || depth > 7 || urls.length >= 4) return;
-      const u = n.url || n.URL;
-      if (typeof u === "string" && /\.mpd|\/dash\/|\.m3u8/i.test(u) && !seen.has(u)) {
-        seen.add(u);
-        urls.push(u);
-      }
+    const walk = (n, depth, underMedia) => {
+      if (!n || typeof n !== "object" || depth > 9 || urls.length >= 6) return;
       for (const k in n) {
         const v = n[k];
-        if (v && typeof v === "object") walk(v, depth + 1);
+        const inMedia = underMedia || MEDIA_KEYS.test(k);
+        if (typeof v === "string") {
+          if (inMedia && /^https?:/.test(v) && !seen.has(v)) {
+            seen.add(v);
+            urls.push(v);
+          }
+        } else if (v && typeof v === "object") {
+          walk(v, depth + 1, inMedia);
+        }
       }
     };
-    walk(node.audioVideoUrls || node, 0);
+    walk(root, 0, false);
     return urls;
+  }
+
+  function noteMedia(root) {
+    if (mediaUrls.length) return;
+    const found = collectMediaUrls(root);
+    if (!found.length) return;
+    mediaUrls = found;
+    console.log("[YLR] Prime media urls:", found.length, "|", found[0].slice(0, 140));
+    if (cached) {
+      cached.manifests = found;
+      post();
+    }
   }
 
   function handleResources(node) {
     const tracks = collectTracks(node);
     if (!tracks.length) return false;
-    const manifests = collectManifests(node);
-    console.log("[YLR] Prime media manifests:", manifests.length, manifests[0] || "(none found)");
-    cached = { tracks, manifests, mediaId: idOf(node), title: titleOf(node) };
+    if (!shapeLogged) {
+      shapeLogged = true;
+      // What else came back alongside the subtitles? Names the container that
+      // would hold the media urls, if this response has one at all.
+      console.log("[YLR] playback resources keys:", Object.keys(node).join(","));
+    }
+    cached = { tracks, manifests: mediaUrls, mediaId: idOf(node), title: titleOf(node) };
     console.log(
       "[YLR] Prime subtitle tracks:",
       tracks.map((t) => t.languageCode + "/" + t.kind).join(", "),
@@ -195,14 +224,18 @@
       text.length > 200 &&
       (text.indexOf("subtitleUrls") !== -1 ||
         text.indexOf("forcedNarratives") !== -1 ||
-        text.indexOf("captionUrls") !== -1)
+        text.indexOf("captionUrls") !== -1 ||
+        text.indexOf("audioVideoUrls") !== -1 ||
+        text.indexOf("avCdnUrlSets") !== -1)
     );
   }
 
   function scanText(text) {
     if (!looksLikeResources(text)) return;
     try {
-      scanDeep(origParse(text), 0);
+      const data = origParse(text);
+      scanDeep(data, 0);
+      noteMedia(data);
     } catch (e) {
       console.log("[YLR] Prime resources parse failed:", e && e.message);
     }
@@ -211,7 +244,10 @@
   JSON.parse = function (text) {
     const data = origParse.apply(this, arguments);
     try {
-      if (looksLikeResources(text)) scanDeep(data, 0);
+      if (looksLikeResources(text)) {
+        scanDeep(data, 0);
+        noteMedia(data);
+      }
     } catch (e) {}
     return data;
   };

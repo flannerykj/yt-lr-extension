@@ -143,8 +143,8 @@ Steps 1–4 and 6 are working and verified. Step 5 depends on the title:
   permission.
 - **Title ships only xHE-AAC, and the OS can play it** → hidden-player route.
   Works, but 1x.
-- **Title ships only xHE-AAC and the OS cannot play it** → route B is closed.
-  Clips fall back to tab capture (one toolbar click, audible replay).
+- **Title ships only xHE-AAC and the OS cannot play it** → no audio for that
+  title; the line saves as text with the reason attached.
 
 The console reports which of these applies at page load:
 
@@ -182,8 +182,8 @@ and the `v=` parameter would reveal which stream it chose.
 **Longevity.** Two things here are properties of Netflix's packaging today, not
 guarantees: that audio ships unencrypted, and that a browser-playable codec is
 offered. Both are checked at runtime and both fail loudly — `ensureIndex()` names
-an `enca`/`sinf` box, `ensureStream()` names a codec it cannot use — and clips
-fall back to tab capture rather than breaking.
+an `enca`/`sinf` box, `ensureStream()` names a codec it cannot use — and the line
+saves as text with the reason rather than breaking.
 
 ## A note on method
 

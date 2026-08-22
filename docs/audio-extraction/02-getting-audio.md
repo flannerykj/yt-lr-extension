@@ -36,17 +36,15 @@ different decode paths — see [04-netflix-audio.md](04-netflix-audio.md).
 **Used by:** YouTube (as a secondary path, decoding the segments the player
 already downloaded), Netflix (the primary attempt).
 
-## C. Record the tab
+## C. Record the tab *(removed)*
 
-`chrome.tabCapture` hands back a `MediaStream` of whatever the tab is playing out
-loud. Since it taps after decoding, DRM is irrelevant.
+`chrome.tabCapture` can hand back a `MediaStream` of whatever the tab is playing
+out loud, which sidesteps DRM entirely. It was implemented and then taken out: it
+needs a click on the extension's toolbar icon before every session, only captures
+what is audible *now* — so a line that has not played must be seeked to and
+replayed audibly — and it runs at 1x. Too much friction for what it bought.
 
-The costs are real: Chrome only grants it after a click on the extension's
-toolbar icon (nothing inside the page can trigger that), it only captures what is
-audible *now*, so a line that has not played must be seeked to and replayed
-audibly, and it runs at 1x.
-
-**Used by:** Prime Video, and Netflix as a last resort.
+Its removal is why Prime Video saves text only.
 
 ## Which site uses what, and why
 
@@ -54,17 +52,33 @@ audibly, and it runs at 1x.
 |---|---|---|---|
 | DRM | no | yes | yes |
 | A: element tap | ✅ primary | ✗ silence | ✗ silence |
-| B: fetch + decode | ✅ fallback | ✅ primary | ✗ audio encrypted with video |
-| C: tab capture | not needed | last resort | ✅ primary |
-| Toolbar click needed | no | only for C | yes |
+| B: fetch + decode | ✅ fallback | ✅ primary | ❓ untested — see below |
+| Audio clips | yes | yes | **no — text only** |
 
 **YouTube** is the easy case and the reason the architecture looks like it does.
 No DRM, so the tap works, and the ring buffer makes starring instant.
 
-**Prime Video** encrypts audio and video together, so B is closed and C is the
-only route. Hence the banner asking for the toolbar click, and `replayable: true`
-on the adapter — starring a line outside the buffer seeks the player back, records
-the line as it plays, and restores the playhead.
+**Prime Video** currently saves text only. The element tap is dead (DRM), and
+route B has **never actually been tested** — the assumption that Amazon encrypts
+audio together with video is just that, an assumption. `prime-inject.js` already
+collects the DASH manifest URLs out of the playback resources and `prime.js`
+probes one at load, logging whether the audio adaptation set carries a
+`ContentProtection` element:
+
+```
+[YLR] audio probe: 1 audio adaptation set(s), 0 encrypted → direct fetch LOOKS POSSIBLE
+```
+
+Nobody has read that line yet. If it says possible, Prime clips are reachable —
+see below for what would still need building.
+
+Two things differ from Netflix even then. Netflix's manifest hands over a
+**complete audio file per language** with a `sidx` index, so a time range maps to
+a byte range in one step. Prime hands over a **DASH `.mpd`**, so the manifest has
+to be parsed for the audio adaptation set, its `BaseURL`/`SegmentTemplate` and its
+segment timeline before any of `mp4.js` becomes useful. More work, but ordinary
+work — the decode half (`sidx`/`stbl` → ADTS → `decodeAudioData`) is already
+written and site-agnostic.
 
 **Netflix** is the interesting one. The element tap is dead, but the audio ships
 unencrypted, so B works — via one of two decode routes depending on the codec the
@@ -77,8 +91,8 @@ title uses. That has its own document, since getting there was most of the work.
 ```js
 // 1. Fetch and decode directly, if the adapter offers it and the live tap
 //    is not already running with the range in hand.
-// 2. Slice out of the live ring buffer.
-// 3. Replay the range and record it.
+// 2. Slice out of the live ring buffer, where the element can be tapped.
+// Neither → throw; saveClip stores the line's text and the reason.
 ```
 
 The adapter declares its capabilities and core reacts to them, rather than core
@@ -87,8 +101,7 @@ knowing about sites:
 | Adapter property | Meaning |
 |---|---|
 | `audioSegments(start, end)` | can fetch and decode — enables route B |
-| `audioEnabled()` | uses tab capture, and reports whether it is granted |
-| `replayable` | may seek the user's player to re-record a range |
+| `setupAudio(capture)` | can hand us a tappable media element |
 | `syncable` | its timeline drifts (ads) and needs correcting |
 | `playerRoot()` | the element to narrow for push mode, and to read captions from |
 
