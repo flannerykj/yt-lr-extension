@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Language Sidebar",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Language-Reactor-style subtitle sidebar for YouTube, Netflix and Prime Video. Star a phrase to save its text and a real audio clip of that exact time range.",
   "permissions": ["storage", "tabCapture"],
   "host_permissions": [

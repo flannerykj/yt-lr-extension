@@ -1,8 +1,12 @@
+:root {
+  --ylr-width: 380px;
+}
+
 #ylr-sidebar {
   position: fixed;
   top: 0;
   right: 0;
-  width: 380px;
+  width: var(--ylr-width);
   height: 100vh;
   z-index: 2147483000;
   display: flex;
@@ -35,7 +39,22 @@ html.ylr-open #ylr-sidebar {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
 }
 html.ylr-open #ylr-toggle {
-  right: 392px;
+  right: calc(var(--ylr-width) + 12px);
+}
+
+/* Push mode: the page gives up the width instead of being covered by it.
+   Only the width is touched. An earlier version put a `transform` on <body> so
+   that the players' `position: fixed; inset: 0` containers would resolve against
+   the narrowed body — but that also re-anchors them to the *document* rather
+   than the viewport, and on a page taller than the screen the player ends up
+   pinned somewhere off-screen. Those containers are narrowed directly instead
+   (see applyLayout), which leaves fixed positioning alone. */
+html.ylr-push.ylr-open body {
+  width: calc(100vw - var(--ylr-width)) !important;
+  min-width: 0 !important;
+}
+html.ylr-push.ylr-open {
+  overflow-x: hidden;
 }
 
 .ylr-head {
@@ -341,10 +360,17 @@ html.ylr-open #ylr-toggle {
   pointer-events: none;
 }
 
-/* We load caption tracks via the player to fetch them, which makes YouTube draw
-   its own captions over the video. Hide that overlay while our sidebar is open. */
-html.ylr-open .ytp-caption-window-container {
-  display: none !important;
+/* The sidebar already shows the line being spoken, so the player's own overlay is
+   a duplicate. Hidden with opacity rather than display:none on purpose — Prime's
+   drift correction reads that overlay's text to work out how far ads have pushed
+   the timeline, and a display:none subtree can stop being updated. */
+html.ylr-hidecc.ylr-open .ytp-caption-window-container,
+html.ylr-hidecc.ylr-open .player-timedtext,
+html.ylr-hidecc.ylr-open [data-uia="player-timedtext"],
+html.ylr-hidecc.ylr-open .atvwebplayersdk-captions-overlay,
+html.ylr-hidecc.ylr-open [class*="captions-overlay"] {
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
 .ylr-subbar {
@@ -500,15 +526,36 @@ html.ylr-open .ytp-caption-window-container {
   font-size: 12px;
   line-height: 1.5;
 }
-.ylr-audio-note b {
-  color: #ffca28;
+.ylr-audio-note b,
+.ylr-audio-why {
+  color: #e8d9b0;
 }
 .ylr-capture-status {
-  padding: 7px 12px;
+  position: relative;
+  padding: 7px 30px 7px 12px;
   background: #17303f;
   border-bottom: 1px solid #1c1c1c;
   color: #9fd0ef;
   font-size: 12px;
+  line-height: 1.5;
+}
+.ylr-capture-dismiss {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  color: #6f9fbb;
+}
+/* These two carry the diagnostics, so their text has to be selectable — the
+   surrounding sidebar suppresses selection for drag-to-save. */
+.ylr-capture-status,
+.ylr-audio-note {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+.ylr-capture-dismiss,
+.ylr-audio-dismiss {
+  cursor: pointer;
 }
 
 .ylr-audio-note {

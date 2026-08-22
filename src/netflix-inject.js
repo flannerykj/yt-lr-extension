@@ -3,7 +3,9 @@
 // manifest, extract the WebVTT tracks, and post them to the content script. Also
 // handles seeking through Netflix's player API.
 (function () {
-  console.log("[YLR] netflix-inject loaded");
+  // Bump with every change to this file: the boot line is how we tell whether a
+  // tab is running current code or a stale injection from before a reload.
+  console.log("[YLR] netflix-inject loaded — build 13");
   const origParse = JSON.parse;
   const originalFetch = window.fetch;
   // Netflix prefetches the NEXT episode's manifest a few minutes before the
@@ -13,6 +15,7 @@
   const manifests = new Map(); // movieId -> { tracks, audio, mediaId, title }
   let latest = null;
   let currentMovieId = "";
+  let currentAudioTrackId = "";
 
   function urlFrom(urls) {
     if (!urls) return null;
@@ -85,6 +88,12 @@
         name: t.languageDescription || t.language,
         trackType: t.trackType || t.rawTrackType || "",
         channels: t.channels || "",
+        // A title often carries two tracks for one language (a Castilian and a
+        // Latin American dub, say). Every id the manifest offers is kept so the
+        // one the player reports as playing can be matched against them.
+        ids: [t.id, t.new_track_id, t.trackId, t.newTrackId]
+          .filter((v) => v != null)
+          .map(String),
         streams
       });
     }
@@ -237,6 +246,22 @@
     }, 1500);
   }
 
+  // Which dub is playing. The manifest can list several tracks per language, so
+  // language alone doesn't identify the audio the viewer is actually hearing.
+  function playingAudioTrackId() {
+    try {
+      const api = window.netflix.appContext.state.playerApp.getAPI().videoPlayer;
+      const ids = api.getAllPlayerSessionIds();
+      const sid = ids.find((i) => String(i).indexOf("watch") !== -1) || ids[0];
+      const player = api.getVideoPlayerBySessionId(sid);
+      const track = player && player.getAudioTrack && player.getAudioTrack();
+      if (!track) return "";
+      return String(track.trackId || track.id || track.new_track_id || "");
+    } catch (e) {
+      return "";
+    }
+  }
+
   // Which movie is on screen, straight from the player when it will say.
   function playingMovieId() {
     try {
@@ -253,15 +278,23 @@
 
   // Backup for the same question: the playback heartbeat names the movie it is
   // reporting progress for.
-  function noteHeartbeat(id) {
-    if (!id || id === currentMovieId) return;
-    currentMovieId = id;
-    console.log(
-      "[YLR] now playing movieId",
-      id,
-      manifests.has(id) ? "(manifest known)" : "(waiting for its manifest)"
-    );
-    post();
+  function noteHeartbeat(id, audioTrackId) {
+    let changed = false;
+    if (id && id !== currentMovieId) {
+      currentMovieId = id;
+      changed = true;
+      console.log(
+        "[YLR] now playing movieId",
+        id,
+        manifests.has(id) ? "(manifest known)" : "(waiting for its manifest)"
+      );
+    }
+    if (audioTrackId && audioTrackId !== currentAudioTrackId) {
+      currentAudioTrackId = audioTrackId;
+      changed = true;
+      console.log("[YLR] audio track in use:", audioTrackId);
+    }
+    if (changed) post();
   }
 
   function post() {
@@ -271,7 +304,12 @@
     if (playing && manifests.has(playing)) entry = manifests.get(playing);
     else if (!playing) entry = latest; // nothing has told us yet; best guess
     if (!entry) return;
-    window.postMessage(Object.assign({ source: "YLR", type: "NF_TRACKS" }, entry), "*");
+    const audioTrackId = playingAudioTrackId() || currentAudioTrackId;
+    if (audioTrackId) currentAudioTrackId = audioTrackId;
+    window.postMessage(
+      Object.assign({ source: "YLR", type: "NF_TRACKS", audioTrackId }, entry),
+      "*"
+    );
   }
 
   let discoveryLogged = false;
@@ -288,7 +326,10 @@
       // A playback heartbeat: movieId plus a position and a session. This is
       // the video on screen, as opposed to one being prefetched.
       if (node.position != null && (node.sessionId || node.xid)) {
-        noteHeartbeat(String(node.movieId));
+        noteHeartbeat(
+          String(node.movieId),
+          node.audioTrackId == null ? "" : String(node.audioTrackId)
+        );
         return true;
       }
       if (!discoveryLogged) {

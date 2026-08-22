@@ -10,6 +10,9 @@
   let audioTracks = [];
   let selectedLang = "";
   const indexCache = new Map(); // stream url -> { init, entries }
+  let probe = { probed: false, ok: false, reason: "" };
+  let chosen = null; // { stream, index, config } — the stream we can actually decode
+  let audioTrackId = ""; // the dub the player says it is playing
 
   function getVideo() {
     return document.querySelector("video");
@@ -82,7 +85,19 @@
     if (ev.source !== window || ev.data?.source !== "YLR") return;
     if (ev.data.type === "NF_TRACKS") {
       tracks = ev.data.tracks || [];
-      if (ev.data.mediaId !== mediaId) indexCache.clear();
+      if (ev.data.mediaId !== mediaId) {
+        indexCache.clear();
+        chosen = null;
+        probe = { probed: false, ok: false, reason: "" };
+      }
+      const nextAudioId = ev.data.audioTrackId || "";
+      if (nextAudioId !== audioTrackId) {
+        audioTrackId = nextAudioId;
+        // Switching dub mid-playback means the chosen stream is now the wrong
+        // one, so let it be picked again.
+        chosen = null;
+        probe = { probed: false, ok: false, reason: "" };
+      }
       audioTracks = ev.data.audio || [];
       mediaId = ev.data.mediaId;
       announceTracks(ev.data, 0);
@@ -111,30 +126,115 @@
   // subtitles), then the original-language track. Within a track take the
   // lowest-bitrate AAC: the smallest download, and the codec decodeAudioData
   // handles most reliably.
-  function pickStream() {
+  // Netflix offers several codecs per language. xHE-AAC is usually the
+  // lowest-bitrate one, which made it the naive first pick — but the browser
+  // can't decode it here, so plain AAC has to win regardless of size.
+  function streamScore(stream) {
+    const p = (stream.profile || "").toLowerCase();
+    if (/xhe/.test(p)) return 3; // must be tested before the heaac match below
+    if (/ddplus|eac-?3|ac-?3|atmos|dts/.test(p)) return 2;
+    if (/heaac|aac|mp4a/.test(p)) return 0;
+    return 1;
+  }
+
+  // A title can carry several audio tracks for one language — a Castilian and a
+  // Latin American dub, a descriptive-audio variant. Language alone would pick
+  // whichever came first, which is a coin flip; the player tells us which one is
+  // actually playing, so match on that when we have it.
+  function pickTrack() {
     if (!audioTracks.length)
       throw new Error("the player manifest listed no audio streams");
+    if (audioTrackId) {
+      const exact = audioTracks.find(
+        (t) => t.ids && t.ids.indexOf(audioTrackId) !== -1
+      );
+      if (exact) return { track: exact, why: "matched the playing audio track" };
+      console.log(
+        "[YLR] audio track",
+        audioTrackId,
+        "matched none of",
+        audioTracks.map((t) => (t.ids || []).join("/") || "(no id)").join(", ")
+      );
+    }
     const want = (selectedLang || "").toLowerCase().slice(0, 2);
+    const sameLang = audioTracks.filter((t) =>
+      want ? (t.language || "").toLowerCase().startsWith(want) : false
+    );
+    if (sameLang.length > 1)
+      console.log(
+        "[YLR] several",
+        want,
+        "audio tracks and no id to choose between them:",
+        sameLang.map((t) => t.name || t.language).join(", ")
+      );
     const track =
-      (want && audioTracks.find((t) => (t.language || "").toLowerCase().startsWith(want))) ||
+      sameLang.find((t) => /primary/i.test(t.trackType)) ||
+      sameLang[0] ||
       audioTracks.find((t) => /primary/i.test(t.trackType)) ||
       audioTracks[0];
-    const aac = track.streams.filter((s) => /aac|mp4a/i.test(s.profile));
-    const pool = aac.length ? aac : track.streams;
-    const stream = pool.slice().sort((a, b) => (a.bitrate || 1e9) - (b.bitrate || 1e9))[0];
+    return { track, why: sameLang.length ? "matched the subtitle language" : "fell back to the primary track" };
+  }
+
+  function rankedStreams() {
+    const { track, why } = pickTrack();
+    const ranked = track.streams
+      .slice()
+      .sort((a, b) => streamScore(a) - streamScore(b) || (a.bitrate || 1e9) - (b.bitrate || 1e9));
     console.log(
-      "[YLR] audio stream:",
-      track.language,
-      stream.profile || "(profile unknown)",
-      (stream.bitrate || "?") + "kbps"
+      "[YLR] audio track:",
+      (track.name || track.language) + " —",
+      why + " |",
+      ranked.map((s) => (s.profile || "?") + "@" + (s.bitrate || "?")).join(", ")
     );
-    if (!aac.length)
-      console.log(
-        "[YLR] note: no AAC stream for this track — " +
-          (stream.profile || "unknown codec") +
-          " may not decode in the browser"
-      );
-    return stream;
+    return ranked;
+  }
+
+  // Walk the ranked streams until one has an index and a codec we can decode.
+  async function ensureStream() {
+    if (chosen) return chosen;
+    const tried = [];
+    for (const stream of rankedStreams()) {
+      const label = stream.profile || "?";
+      try {
+        const index = await ensureIndex(stream);
+        const codec = NS.mp4.codecOf(index.init);
+        if (codec !== "mp4a") throw new Error("codec " + (codec || "unknown"));
+        const config = NS.mp4.audioConfig(index.init);
+        if (!config) throw new Error("no readable audio config");
+        // ADTS can't describe every codec, but the browser may still be able to
+        // *play* one — and since we fetched these bytes ourselves they carry no
+        // DRM, so a hidden element can be tapped directly.
+        let mime = "";
+        if (!config.adtsCapable) {
+          mime = 'audio/mp4; codecs="mp4a.40.' + config.profile + '"';
+          const can = typeof Audio !== "undefined" ? new Audio().canPlayType(mime) : "";
+          if (!can)
+            throw new Error(
+              NS.mp4.aotName(config.profile) + " can be neither remuxed nor played here"
+            );
+          console.log(
+            "[YLR]",
+            NS.mp4.aotName(config.profile),
+            "can't be remuxed, but this browser can play it (" + can + ") —",
+            "clips will be recorded from a hidden player instead"
+          );
+        }
+        chosen = { stream, index, config, playbackOnly: !config.adtsCapable, mime };
+        console.log(
+          "[YLR] audio stream chosen:",
+          label,
+          (stream.bitrate || "?") + "kbps |",
+          NS.mp4.aotName(config.profile),
+          "freq" + config.freqIndex,
+          config.channels + "ch"
+        );
+        return chosen;
+      } catch (e) {
+        tried.push(label + " — " + e.message);
+        console.log("[YLR] audio stream unusable:", label, "—", e.message);
+      }
+    }
+    throw new Error("no usable audio stream (" + tried.join("; ") + ")");
   }
 
   function base64ToBuffer(b64) {
@@ -209,11 +309,28 @@
     return index;
   }
 
+  async function probeAudio() {
+    if (probe.probed) return;
+    probe.probed = true;
+    try {
+      const { index } = await ensureStream();
+      probe.ok = true;
+      console.log(
+        "[YLR] AUDIO OK — " +
+          index.entries.length +
+          " subsegments, clips can be fetched directly"
+      );
+    } catch (e) {
+      probe.ok = false;
+      probe.reason = e.message;
+      console.log("[YLR] AUDIO UNAVAILABLE — " + e.message);
+    }
+  }
+
   // core's ClipExtractor contract: the bytes for [start,end] plus the
   // presentation time the returned buffer actually begins at.
   async function audioSegments(start, end) {
-    const stream = pickStream();
-    const index = await ensureIndex(stream);
+    const { stream, index, playbackOnly, mime } = await ensureStream();
     const range = NS.mp4.rangeFor(index.entries, start, end);
     if (!range)
       throw new Error("no audio segments cover " + start.toFixed(1) + "-" + end.toFixed(1) + "s");
@@ -233,19 +350,26 @@
     // decodeAudioData rejects fragmented MP4, so hand it plain ADTS AAC and keep
     // the original as a fallback for anything this remux can't handle.
     const adts = NS.mp4.toADTS(index.init, bytes);
-    console.log(
-      "[YLR] clip bytes:",
-      bytes.byteLength,
-      "| codec",
-      adts.codec || "unknown",
-      adts.buffer
-        ? "| " + adts.frames + " AAC frames -> " + adts.buffer.byteLength + " bytes ADTS"
-        : "| no remux (" + adts.reason + "), sending fragmented MP4"
-    );
+    // Carried into any decode failure, so the reason shown in the sidebar names
+    // what was actually handed to the decoder.
+    const describe =
+      (adts.codec || "codec?") +
+      (adts.config
+        ? " AOT" + adts.config.profile + "/freq" + adts.config.freqIndex + "/" + adts.config.channels + "ch"
+        : " no-config") +
+      (adts.buffer
+        ? ", " + adts.frames + " frames, " + Math.round(adts.buffer.byteLength / 1024) + "KB ADTS"
+        : ", no remux: " + adts.reason) +
+      (adts.skipped ? ", " + adts.skipped + " skipped" : "") +
+      ", fmp4 " + Math.round(fmp4.byteLength / 1024) + "KB";
+    console.log("[YLR] clip bytes:", bytes.byteLength, "|", describe);
     return {
-      buffer: adts.buffer || fmp4,
-      fallbackBuffer: adts.buffer ? fmp4 : null,
-      t0: range.t0
+      buffer: playbackOnly ? fmp4 : adts.buffer || fmp4,
+      fallbackBuffer: playbackOnly || !adts.buffer ? null : fmp4,
+      playbackOnly: !!playbackOnly,
+      mime: mime || "audio/mp4",
+      t0: range.t0,
+      describe
     };
   }
 
@@ -303,6 +427,18 @@
 
   NS.adapter = {
     name: "netflix",
+    // Last resort when the audio can't be fetched at all: record the tab while
+    // playing the line again, as on Prime Video.
+    replayable: true,
+    // The watch page is a full-viewport fixed layout, so push mode has to narrow
+    // this container directly rather than relying on the body's width.
+    playerRoot() {
+      return (
+        document.querySelector(".watch-video, [data-uia='player']") ||
+        (getVideo() && getVideo().parentElement) ||
+        null
+      );
+    },
     isWatchPage() {
       return location.pathname.startsWith("/watch/");
     },
@@ -347,8 +483,12 @@
       window.postMessage({ source: "YLR-CS", type: "NF_REFRESH_TITLE" }, "*");
       return domTitle();
     },
+    directAudioStatus() {
+      return probe;
+    },
     async loadTrack(track) {
       selectedLang = track.languageCode || "";
+      probeAudio();
       const res = await fetch(track.url);
       if (!res.ok) throw new Error("subtitle fetch HTTP " + res.status);
       const body = await res.text();

@@ -4,7 +4,7 @@
 (function () {
   const NS = (window.YLR = window.YLR || {});
   const KEY = "ylr-settings";
-  const DEFAULTS = { wordHighlight: false };
+  const DEFAULTS = { wordHighlight: false, pushPage: true, hidePlayerCaptions: true };
 
   let cache = Object.assign({}, DEFAULTS);
   const listeners = [];

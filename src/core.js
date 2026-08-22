@@ -44,7 +44,12 @@
   let wordHighlight = false; // karaoke highlight, off unless switched on
   let lastAudioOk = null;
   let audioNoteDismissed = false;
+  let pushPage = true; // narrow the page instead of covering it
+  let hidePlayerCaptions = true; // the sidebar shows the same line
+  let resizeTimer = null;
+  let lastLayout = "";
   let directAudioFailed = false; // fetching the audio outright stopped working
+  let lastDirectError = "";
 
   function video() {
     return adapter.getVideo();
@@ -186,17 +191,38 @@
         </div>
       </div>
       <div class="ylr-audio-note" hidden>
-        <b>Audio capture is off.</b> Starring saves a real audio clip, and this
-        site's audio is DRM-protected — so it has to be recorded from the tab.
-        Click this extension's icon in the Chrome toolbar once to switch it on for
-        this tab.
+        <span class="ylr-audio-why"></span>
         <button class="ylr-icon ylr-audio-dismiss" title="Dismiss">✕</button>
       </div>
-      <div class="ylr-capture-status" hidden></div>
+      <div class="ylr-capture-status" hidden>
+        <span class="ylr-capture-text"></span>
+        <button class="ylr-icon ylr-capture-dismiss" title="Dismiss">✕</button>
+      </div>
       <div class="ylr-body">
         <div class="ylr-list" data-panel="subs"></div>
         <div class="ylr-saved" data-panel="saved" hidden></div>
         <div class="ylr-settings" data-panel="settings" hidden>
+          <div class="ylr-set-group">
+            <label class="ylr-set-check">
+              <input id="ylr-set-hidecc" type="checkbox">
+              <span>Hide the player's own subtitles</span>
+            </label>
+            <div class="ylr-set-hint">
+              The sidebar already shows the line being spoken, so the overlay on the
+              video is a duplicate. It stays loaded either way — the sidebar needs
+              its text to keep itself in sync through ad breaks.
+            </div>
+          </div>
+          <div class="ylr-set-group">
+            <label class="ylr-set-check">
+              <input id="ylr-set-push" type="checkbox">
+              <span>Make room for the sidebar</span>
+            </label>
+            <div class="ylr-set-hint">
+              Narrows the page so the sidebar sits beside the video instead of on
+              top of it. Turn this off if a site's layout doesn't cope.
+            </div>
+          </div>
           <div class="ylr-set-group">
             <label class="ylr-set-check">
               <input id="ylr-set-word" type="checkbox">
@@ -243,7 +269,9 @@
       lang: root.querySelector(".ylr-lang"),
       body: root.querySelector(".ylr-body"),
       audioNote: root.querySelector(".ylr-audio-note"),
+      audioWhy: root.querySelector(".ylr-audio-why"),
       captureStatus: root.querySelector(".ylr-capture-status"),
+      captureText: root.querySelector(".ylr-capture-text"),
       subbar: root.querySelector(".ylr-subbar"),
       subbarCount: root.querySelector(".ylr-subbar-count"),
       search: root.querySelector(".ylr-search"),
@@ -254,6 +282,8 @@
       saved: root.querySelector('[data-panel="saved"]'),
       settings: root.querySelector('[data-panel="settings"]'),
       setWord: root.querySelector("#ylr-set-word"),
+      setPush: root.querySelector("#ylr-set-push"),
+      setHideCC: root.querySelector("#ylr-set-hidecc"),
       jump: root.querySelector(".ylr-jump"),
       tabs: root.querySelectorAll(".ylr-tab"),
       menu,
@@ -262,6 +292,9 @@
       menuSave: menu.querySelector(".ylr-menu-save")
     };
     els.jump.addEventListener("click", jumpToActive);
+    root.querySelector(".ylr-capture-dismiss").addEventListener("click", () =>
+      setCaptureStatus("")
+    );
     // The mic pill still shows the state, so the banner only has to be seen once.
     root.querySelector(".ylr-audio-dismiss").addEventListener("click", () => {
       audioNoteDismissed = true;
@@ -345,11 +378,33 @@
         console.log("[YLR] could not save settings:", e.message);
       });
     });
+    els.setHideCC.addEventListener("change", () => {
+      hidePlayerCaptions = els.setHideCC.checked;
+      applyLayout();
+      NS.settings.set({ hidePlayerCaptions }).catch((e) => {
+        console.log("[YLR] could not save settings:", e.message);
+      });
+    });
+    els.setPush.addEventListener("change", () => {
+      pushPage = els.setPush.checked;
+      applyLayout();
+      NS.settings.set({ pushPage }).catch((e) => {
+        console.log("[YLR] could not save settings:", e.message);
+      });
+    });
+    document.addEventListener("fullscreenchange", applyLayout);
   }
 
   function showSettings(s) {
-    if (els) els.setWord.checked = !!s.wordHighlight;
+    pushPage = s.pushPage !== false;
+    hidePlayerCaptions = s.hidePlayerCaptions !== false;
+    if (els) {
+      els.setWord.checked = !!s.wordHighlight;
+      els.setPush.checked = pushPage;
+      els.setHideCC.checked = hidePlayerCaptions;
+    }
     applyWordHighlight(!!s.wordHighlight);
+    applyLayout();
   }
 
   function applyWordHighlight(on) {
@@ -359,7 +414,42 @@
 
   function setOpen(open) {
     document.documentElement.classList.toggle("ylr-open", open);
+    applyLayout();
   }
+
+  // Push mode narrows the page rather than sitting on top of it. Suspended in
+  // fullscreen, where the video is meant to own the screen and the top layer
+  // ignores our layout anyway.
+  function applyLayout() {
+    const html = document.documentElement;
+    const push = pushPage && !document.fullscreenElement;
+    html.classList.toggle("ylr-push", push);
+    html.classList.toggle("ylr-hidecc", hidePlayerCaptions);
+    const open = html.classList.contains("ylr-open");
+    // A full-viewport player isn't in normal flow, so narrowing the body does
+    // nothing for it. Narrow the container the adapter points at instead — and
+    // if there isn't one, the sidebar simply overlays as it used to.
+    const root = adapter.playerRoot && adapter.playerRoot();
+    if (root) {
+      if (push && open)
+        root.style.setProperty("width", "calc(100vw - " + SIDEBAR_WIDTH + "px)", "important");
+      else root.style.removeProperty("width");
+    }
+    const key = push + "|" + open + "|" + !!root + "|" + hidePlayerCaptions;
+    if (key === lastLayout) return;
+    lastLayout = key;
+    notifyResize();
+  }
+
+  // Players size themselves in JS off a resize event rather than off CSS, so
+  // taking the space away isn't enough — they have to be told.
+  function notifyResize() {
+    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => window.dispatchEvent(new Event("resize")), 300);
+  }
+
+  const SIDEBAR_WIDTH = 380; // keep in step with --ylr-width in sidebar.css
 
   function switchTab(name) {
     if (name === activeTab) return;
@@ -524,12 +614,10 @@
 
       const star = document.createElement("button");
       star.className = "ylr-star";
-      star.textContent = "☆";
-      star.title = "Save phrase + audio clip";
-      if (state.starred.has(seg.start)) {
-        star.classList.add("ylr-starred");
-        star.textContent = "★";
-      }
+      const saved = state.starred.has(seg.start);
+      star.textContent = saved ? "★" : "☆";
+      star.title = saved ? "Remove this saved clip" : "Save phrase + audio clip";
+      if (saved) star.classList.add("ylr-starred");
       star.addEventListener("click", (e) => {
         e.stopPropagation();
         onStar(seg, star);
@@ -990,9 +1078,9 @@
       else break;
     }
     if (idx !== state.activeIndex) setActive(idx);
-    const ok = audioAvailable();
-    if (ok !== lastAudioOk) {
-      lastAudioOk = ok;
+    const key = audioAvailable() + "|" + (adapter.audioSegments ? directAudioReason() : "");
+    if (key !== lastAudioOk) {
+      lastAudioOk = key;
       updateAudioStatus();
     }
   }
@@ -1305,23 +1393,39 @@
     return !adapter.audioEnabled || adapter.audioEnabled();
   }
 
+  // Why can't this site give us audio right now? The direct fetch is the
+  // preferred route, so if that has failed its reason is the useful one — the
+  // tab-capture advice is only the fallback.
+  function directAudioReason() {
+    const status = adapter.directAudioStatus && adapter.directAudioStatus();
+    if (status && status.probed && !status.ok) return status.reason;
+    return directAudioFailed ? lastDirectError : "";
+  }
+
   function updateAudioStatus() {
     if (!els || !els.audio) return;
     const ok = audioAvailable();
+    const why = adapter.audioSegments ? directAudioReason() : "";
     els.audio.classList.toggle("ylr-audio-on", ok && audioReady);
     els.audio.title = ok
       ? "Audio capture on"
       : "Audio capture off — click the extension's toolbar icon to enable";
     els.audioNote.hidden =
-      ok ||
-      audioNoteDismissed ||
-      !adapter.audioEnabled ||
-      (!!adapter.audioSegments && !directAudioFailed);
+      ok || audioNoteDismissed || !adapter.audioEnabled || (!!adapter.audioSegments && !why);
+    if (els.audioNote.hidden) return;
+    els.audioWhy.textContent = why
+      ? "Couldn't fetch this title's audio: " +
+        why +
+        " — falling back to recording the tab, which needs the extension's " +
+        "toolbar icon clicked once."
+      : "Audio capture is off. This site's audio is DRM-protected, so a clip has " +
+        "to be recorded from the tab — click the extension's icon in the Chrome " +
+        "toolbar once to switch it on.";
   }
 
   function setCaptureStatus(text) {
     if (!els) return;
-    els.captureStatus.textContent = text || "";
+    els.captureText.textContent = text || "";
     els.captureStatus.hidden = !text;
   }
 
@@ -1387,6 +1491,12 @@
     const end = seg.end + syncOffset;
     const extractor = ensureExtractor();
     const canFetch = !!(extractor && adapter.audioSegments);
+    console.log(
+      "[YLR] clip " + start.toFixed(1) + "-" + end.toFixed(1) + "s" +
+        " | direct fetch: " + (canFetch ? "yes" : "no") +
+        " | live tap: " + (audioReady ? "ready" : "off") +
+        " | replay: " + (adapter.replayable ? "yes" : "no")
+    );
 
     if (!canFetch || audioReady) {
       try {
@@ -1420,6 +1530,7 @@
       } catch (e) {
         console.log("[YLR] direct extraction failed:", e.message);
         directAudioFailed = true;
+        lastDirectError = e.message;
         updateAudioStatus();
         if (!(adapter.replayable && audioAvailable())) throw e;
       }
@@ -1447,7 +1558,10 @@
     capture.reset(); // stale tags must not satisfy the range we're about to fill
     adapter.seek(Math.max(0, start - NS.CLIP_PAD.lead - 0.5));
     try {
-      return await capture.capture(start, end, { waitForPlayback: true });
+      return await capture.capture(start, end, {
+        waitForPlayback: true,
+        label: "tab capture"
+      });
     } finally {
       setCaptureStatus("");
       adapter.seek(back);
@@ -1460,12 +1574,21 @@
   async function saveClip(range) {
     let wav = null;
     let audioError = null;
+    // Some routes record in real time, so say so rather than leaving the star
+    // pulsing with no explanation. Only if it actually takes a moment.
+    const slow = setTimeout(
+      () => setCaptureStatus("Capturing audio for this line…"),
+      1200
+    );
     try {
-      wav = await clipFor(range);
+      wav = await withTimeout(clipFor(range), 45000, "audio capture timed out");
       console.log("[YLR] got wav", wav && wav.size, "bytes");
     } catch (e) {
       audioError = e.message || String(e);
       console.log("[YLR] no audio for this clip:", audioError);
+    } finally {
+      clearTimeout(slow);
+      if (!audioError) setCaptureStatus("");
     }
     const record = {
       id:
@@ -1498,27 +1621,66 @@
         (audioError ? "FAILED — " + audioError : Math.round((wav.size || 0) / 1024) + " KB")
     );
     markSaved(range);
-    if (audioError) flashStatus("Saved text only — no audio: " + audioError);
+    if (audioError) flashStatus("Saved text only — no audio: " + audioError, 0);
     return record;
   }
 
+  function withTimeout(promise, ms, message) {
+    let timer = null;
+    return Promise.race([
+      promise.finally(() => clearTimeout(timer)),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      })
+    ]);
+  }
+
   let statusTimer = null;
+  // ms = 0 keeps it up until dismissed — a failure reason is worth reading.
   function flashStatus(text, ms = 6000) {
     setCaptureStatus(text);
     clearTimeout(statusTimer);
-    statusTimer = setTimeout(() => setCaptureStatus(""), ms);
+    if (ms) statusTimer = setTimeout(() => setCaptureStatus(""), ms);
   }
 
   async function onStar(seg, starEl) {
+    if (state.starred.has(seg.start)) return unstar(seg, starEl);
     starEl.classList.add("ylr-capturing");
     try {
       await saveClip({ start: seg.start, end: seg.end, text: seg.text });
       state.starred.add(seg.start);
       starEl.classList.add("ylr-starred");
       starEl.textContent = "★";
+      starEl.title = "Remove this saved clip";
     } catch (e) {
       console.log("[YLR] star failed:", e.message);
       alert("Couldn't save that line: " + e.message);
+    } finally {
+      starEl.classList.remove("ylr-capturing");
+    }
+  }
+
+  // Un-starring throws the clip away. Matched on the line's own span, so a
+  // selection saved from inside the same line is left alone.
+  async function unstar(seg, starEl) {
+    starEl.classList.add("ylr-capturing");
+    try {
+      const id = adapter.currentMediaId();
+      const clips = await NS.db.all();
+      const doomed = clips.filter(
+        (c) =>
+          c.videoId === id &&
+          Math.abs(c.start - seg.start) < 0.05 &&
+          Math.abs(c.end - seg.end) < 0.05
+      );
+      for (const clip of doomed) await NS.db.remove(clip.id);
+      state.starred.delete(seg.start);
+      console.log("[YLR] removed", doomed.length, "clip(s) at", seg.start.toFixed(1) + "s");
+      await loadSavedRanges(); // re-renders with the star and word marks cleared
+      flashStatus(doomed.length ? "Removed from Saved." : "Nothing saved for that line.");
+    } catch (e) {
+      console.log("[YLR] unstar failed:", e.message);
+      alert("Couldn't remove that clip: " + e.message);
     } finally {
       starEl.classList.remove("ylr-capturing");
     }
@@ -1726,6 +1888,7 @@
       ensureCapture().catch((e) => console.log("[YLR] pre-warm audio:", e.message));
     if (!state.segments.length)
       els.list.innerHTML = '<div class="ylr-note">Loading subtitles…</div>';
+    applyLayout(); // the player container may only just have appeared
     adapter.requestTracks();
   }
 
@@ -1768,6 +1931,17 @@
     };
     window.addEventListener("pointerdown", startOnce, { once: true, capture: true });
   }
+
+  console.log(
+    "[YLR] core " +
+      ((chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "?") +
+      " on " +
+      adapter.name +
+      " | direct fetch: " +
+      (NS.ClipExtractor && adapter.audioSegments ? "available" : "no") +
+      " | tab capture: " +
+      (adapter.audioEnabled ? "needs enabling" : "n/a")
+  );
 
   checkLocation();
 })();

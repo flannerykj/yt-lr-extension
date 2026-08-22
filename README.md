@@ -15,6 +15,32 @@ including on the DRM sites, which Language Reactor itself only saves text for.
 4. Open a YouTube video, or a Prime Video / Netflix title with subtitles. A
    sidebar appears on the right; the `字A` button toggles it.
 
+### The sidebar makes room for itself
+By default the page is narrowed rather than covered, so the player sits beside
+the sidebar and reflows as if the window were smaller. **Settings → Make room for
+the sidebar** turns that off if a site's layout doesn't cope.
+
+Narrowing the body isn't enough on the streaming sites: their players live in
+`position: fixed; inset: 0` containers, which aren't in normal flow and ignore a
+width set on an ancestor. Those containers are narrowed **directly**, via the
+element each adapter reports as `playerRoot()`. If an adapter has none, or its
+selector doesn't match, that site is simply overlaid as before — the failure mode
+is cosmetic. Players also size themselves in JS off a `resize` event, so one is
+dispatched after the change, and push mode is suspended in fullscreen.
+
+An earlier version instead put a `transform` on `<body>` to make it the
+containing block for those fixed players. That does narrow them, but it also
+re-anchors them to the *document* rather than the viewport — so on any page
+taller than the screen the player lands off-screen entirely. Don't reintroduce
+it.
+
+### Hiding the player's own subtitles
+On by default (**Settings → Hide the player's own subtitles**): the sidebar
+already shows the line being spoken, so the overlay on the video is a duplicate.
+It is hidden with `opacity`, not `display: none` — Prime's drift correction reads
+that overlay's text to work out how far ad breaks have pushed the timeline, and a
+`display: none` subtree can stop being updated.
+
 ### Filtering the list
 The search box at the top of the **Subtitles** tab filters the list to the lines
 containing what you type, and marks the matching words. Matching ignores case
@@ -28,6 +54,10 @@ default. With it off the line being spoken is still shaded, but the word-by-word
 karaoke highlight is not painted. The preference lives in `chrome.storage.local`,
 so it is shared between YouTube and Prime Video and takes effect immediately in
 sidebars already open in other tabs.
+
+### Un-saving
+Tapping a filled ★ deletes that clip and clears its highlight. A selection saved
+from inside the same line is matched on its own span, so it is left alone.
 
 ### Downloading a whole subtitle track
 With the **Subtitles** tab open, the bar under the header shows the line count and
@@ -67,11 +97,43 @@ the index is fetched once per episode.
 
 The remux matters: `decodeAudioData` refuses a fragmented MP4, because the `moov`
 carries no sample tables — the samples are described by the `trun` in each `moof`.
-So `mp4.js` reads the sample sizes from the fragments, pulls the raw AAC frames
-out of the `mdat`s, and gives each one an ADTS header, using the codec settings
-from the `esds` AudioSpecificConfig (unwrapping HE-AAC's SBR layer to its AAC-LC
-core). The original container is kept as a fallback in case a stream turns up
-that this can't remux.
+So `mp4.js` reads each sample's **offset and size** from the fragments (the
+`trun`'s `data_offset`, measured from the start of its `moof` — not simply the
+first byte after the `mdat` header), pulls the raw AAC frames out, and gives each
+one an ADTS header built from the `esds` AudioSpecificConfig, unwrapping HE-AAC's
+SBR layer to its AAC-LC core. The original container is kept as a fallback.
+
+**Picking the right dub.** A title often carries several audio tracks for one
+language — a Castilian and a Latin American Spanish, say, or a descriptive-audio
+variant. Matching on language alone picks whichever comes first, which is a coin
+flip. The playback heartbeat carries an `audioTrackId`, and the player API
+answers `getAudioTrack()`, so the track is matched on that id; language is only
+the fallback, and the console says which rule applied. Changing dub mid-playback
+re-picks the stream.
+
+**Three routes, because Netflix's codec choice varies.** Netflix offers several streams per language, and
+its lowest-bitrate one is usually **xHE-AAC** — which has no ADTS representation
+(the header describes the profile in two bits, so only audio object types 1-4)
+and which the browser won't decode from the container either. Streams are
+therefore ranked by codec before bitrate: plain AAC first, Dolby and xHE-AAC
+last, and each candidate is checked against its `esds` before being committed to.
+Picking purely by bitrate silently chose xHE-AAC and produced ADTS frames whose
+headers claimed AAC-LC — valid-looking, undecodable.
+
+Some titles offer **only** xHE-AAC. There the bytes are still ours and still
+un-DRM'd, so if `canPlayType` says the browser can play the codec, the fragments
+go into a Blob, a hidden `<audio>` element plays them, and the graph is tapped
+through the same worklet the live buffer uses. Note that such a Blob does **not**
+start at zero: each fragment's `tfdt` keeps its absolute presentation time, so the
+element's clock picks up wherever in the title the fragments came from. That
+origin can't be read from `seekable` (often still empty at `loadedmetadata`), and
+seeking to a time outside the media stalls playback outright — so playback starts
+first and the origin is taken from the first audio that actually arrives. That one
+value doubles as proof the codec is really being decoded, which `canPlayType`
+only claims. That runs at 1x and so costs the
+length of the clip, but it is silent and never touches your player. If even that
+is refused, clips fall back to tab capture (`replayable`), which needs the
+toolbar-icon click.
 
 If the audio ever comes back encrypted (an `enca`/`sinf` box), the sidebar says
 so and falls back to the tab-capture path below.

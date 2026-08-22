@@ -213,7 +213,18 @@
       aot = readAOT();
     }
     if (!channels || freqIndex > 12) return null;
-    return { profile: aot, freqIndex, channels };
+    // ADTS carries the profile in two bits, so it can only describe audio object
+    // types 1-4 (Main / LC / SSR / LTP). Anything else — notably xHE-AAC, which
+    // Netflix ships as its lowest-bitrate stream — has no ADTS representation.
+    return { profile: aot, freqIndex, channels, adtsCapable: aot >= 1 && aot <= 4 };
+  }
+
+  function aotName(aot) {
+    if (aot === 2) return "AAC-LC";
+    if (aot === 5) return "HE-AAC";
+    if (aot === 29) return "HE-AACv2";
+    if (aot === 42) return "xHE-AAC";
+    return "audio object type " + aot;
   }
 
   // ES_Descriptor (0x03) -> DecoderConfigDescriptor (0x04) -> DecSpecificInfo
@@ -281,18 +292,27 @@
     return out;
   }
 
-  // Sample sizes for one fragment, from its trun (or the tfhd default).
-  function fragmentSampleSizes(buffer, moof) {
+  // Where each sample of one fragment lives: its byte offset and size.
+  //
+  // The offset matters as much as the size. A trun's data_offset is measured
+  // from the start of its moof (the DASH default-base-is-moof rule), and it is
+  // NOT always the first byte after the mdat header — assuming that yields
+  // frames sliced at the wrong boundary, which decodes as noise or not at all.
+  function fragmentSamples(buffer, moof) {
     const view = new DataView(buffer);
-    const sizes = [];
+    const out = [];
     for (const traf of childBoxes(buffer, moof).filter((b) => b.type === "traf")) {
       let defaultSize = 0;
+      let baseOffset = moof.start;
       const kids = childBoxes(buffer, traf);
       const tfhd = kids.find((b) => b.type === "tfhd");
       if (tfhd) {
         const flags = view.getUint32(tfhd.start + tfhd.header) & 0xffffff;
         let off = tfhd.start + tfhd.header + 4 + 4; // version/flags + track_ID
-        if (flags & 0x000001) off += 8;
+        if (flags & 0x000001) {
+          baseOffset = view.getUint32(off) * 4294967296 + view.getUint32(off + 4);
+          off += 8;
+        }
         if (flags & 0x000002) off += 4;
         if (flags & 0x000008) off += 4;
         if (flags & 0x000010) defaultSize = view.getUint32(off);
@@ -302,7 +322,11 @@
         let off = trun.start + trun.header + 4;
         const count = view.getUint32(off);
         off += 4;
-        if (flags & 0x000001) off += 4;
+        let at = baseOffset;
+        if (flags & 0x000001) {
+          at = baseOffset + view.getInt32(off);
+          off += 4;
+        }
         if (flags & 0x000004) off += 4;
         const perSample =
           (flags & 0x000100 ? 4 : 0) +
@@ -312,15 +336,17 @@
         for (let i = 0; i < count; i++) {
           let size = defaultSize;
           if (flags & 0x000200) {
-            const at = off + i * perSample + (flags & 0x000100 ? 4 : 0);
-            if (at + 4 > view.byteLength) break;
-            size = view.getUint32(at);
+            const sizeAt = off + i * perSample + (flags & 0x000100 ? 4 : 0);
+            if (sizeAt + 4 > view.byteLength) break;
+            size = view.getUint32(sizeAt);
           }
-          if (size > 0) sizes.push(size);
+          if (size <= 0) break;
+          out.push({ at, size });
+          at += size;
         }
       }
     }
-    return sizes;
+    return out;
   }
 
   function adtsHeader(frameLength, profile, freqIndex, channels) {
@@ -342,25 +368,47 @@
     if (codec !== "mp4a") return { buffer: null, codec, reason: "not AAC" };
     const config = audioConfig(init);
     if (!config) return { buffer: null, codec, reason: "no readable AudioSpecificConfig" };
+    if (!config.adtsCapable)
+      return {
+        buffer: null,
+        codec,
+        config,
+        reason: aotName(config.profile) + " cannot be carried in ADTS"
+      };
 
     const list = boxes(media);
     const parts = [];
     let frames = 0;
+    let skipped = 0;
     for (let i = 0; i < list.length; i++) {
       if (list[i].type !== "moof") continue;
       const mdat = list[i + 1];
       if (!mdat || mdat.type !== "mdat" || mdat.truncated) continue;
-      const sizes = fragmentSampleSizes(media, list[i]);
-      let at = mdat.start + mdat.header; // start of the payload
-      for (const size of sizes) {
-        if (at + size > mdat.end) break;
-        parts.push(adtsHeader(size + 7, config.profile, config.freqIndex, config.channels));
-        parts.push(new Uint8Array(media.slice(at, at + size)));
-        at += size;
+      const payloadStart = mdat.start + mdat.header;
+      const samples = fragmentSamples(media, list[i]);
+      const last = samples[samples.length - 1];
+      // Do the declared offsets land inside this fragment's mdat? If they don't,
+      // the file numbers them from a base outside the range we fetched, so read
+      // the payload straight through instead.
+      const trustOffsets =
+        !!last && samples[0].at >= payloadStart && last.at + last.size <= mdat.end;
+      let cursor = payloadStart;
+      for (const sample of samples) {
+        const at = trustOffsets ? sample.at : cursor;
+        cursor = at + sample.size;
+        if (at < payloadStart || at + sample.size > mdat.end) {
+          skipped++;
+          continue;
+        }
+        parts.push(
+          adtsHeader(sample.size + 7, config.profile, config.freqIndex, config.channels)
+        );
+        parts.push(new Uint8Array(media.slice(at, at + sample.size)));
         frames++;
       }
     }
-    if (!frames) return { buffer: null, codec, reason: "no AAC frames found" };
+    if (!frames)
+      return { buffer: null, codec, config, reason: "no AAC frames found in the fragments" };
     let total = 0;
     for (const p of parts) total += p.length;
     const out = new Uint8Array(total);
@@ -369,7 +417,7 @@
       out.set(p, o);
       o += p.length;
     }
-    return { buffer: out.buffer, codec, config, frames };
+    return { buffer: out.buffer, codec, config, frames, skipped };
   }
 
   NS.mp4 = {
@@ -382,6 +430,7 @@
     concat,
     codecOf,
     audioConfig,
+    aotName,
     toADTS
   };
 })();

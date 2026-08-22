@@ -50,6 +50,7 @@
       this.node = null;
       this.ready = false;
       this.sampleRate = 48000;
+      this.maxPeak = 0; // loudest sample seen, to tell silence from no signal
       this._pending = [];
     }
 
@@ -134,6 +135,7 @@
     reset() {
       this.chunks = [];
       this.samples = 0;
+      this.maxPeak = 0;
     }
 
     resume() {
@@ -149,6 +151,10 @@
       const time = this.video.currentTime;
       this.chunks.push({ time, data });
       this.samples += data.length;
+      for (let i = 0; i < data.length; i += 64) {
+        const a = data[i] < 0 ? -data[i] : data[i];
+        if (a > this.maxPeak) this.maxPeak = a;
+      }
       // Periodic peak so we can tell whether the captured stream has any sound.
       this._dbg = (this._dbg || 0) + 1;
       if (this._dbg % 40 === 0) {
@@ -234,7 +240,11 @@
     // Resolves with a WAV Blob for [start,end]. If not yet buffered (a segment
     // ahead of playback), the promise stays pending and is fulfilled once the
     // buffer fills — the caller is expected to seek/play to make that happen.
-    capture(start, end, { waitForPlayback = false, immediate = false } = {}) {
+    capture(
+      start,
+      end,
+      { waitForPlayback = false, immediate = false, timeoutMs = 0, label = "" } = {}
+    ) {
       const s = Math.max(0, start - PAD.lead);
       const e = end + PAD.tail;
       return new Promise((resolve, reject) => {
@@ -244,7 +254,7 @@
         }
         // The clip extractor drives its own element into the range on purpose, so
         // "not buffered yet" is the expected state there — just wait.
-        if (waitForPlayback) return this._wait(s, e, resolve, reject);
+        if (waitForPlayback) return this._wait(s, e, resolve, reject, timeoutMs, label);
         // Waiting only helps if playback is still heading into this range. Every
         // other case is diagnosable right now, so fail immediately with the
         // reason rather than stalling for the deadline.
@@ -295,21 +305,23 @@
         // Caller has a better source for anything not already buffered, so don't
         // sit here waiting for playback to reach the line.
         if (immediate) return reject(new Error("not in the live buffer yet"));
-        this._wait(s, e, resolve, reject);
+        this._wait(s, e, resolve, reject, timeoutMs, label);
       });
     }
 
-    _wait(s, e, resolve, reject) {
+    _wait(s, e, resolve, reject, timeoutMs, label) {
+      const budget = timeoutMs || (e - s) * 1000 + 15000;
       this._pending.push({
         start: s,
         end: e,
         resolve,
         reject,
-        deadline: performance.now() + (e - s) * 1000 + 15000
+        label,
+        deadline: performance.now() + budget
       });
       // Evaluate the deadline even if no audio chunks arrive (a silent/dead
       // tap would otherwise leave the promise hanging forever).
-      setTimeout(() => this._resolvePending(), (e - s) * 1000 + 15500);
+      setTimeout(() => this._resolvePending(), budget + 500);
     }
 
     _resolvePending() {
@@ -326,14 +338,25 @@
         if (now > p.deadline) {
           const wav = this._slice(p.start, p.end);
           if (wav) p.resolve(wav);
-          else
-            p.reject(
-              new Error(
-                this.chunks.length
-                  ? "timed out capturing audio — try playing the segment first."
-                  : "no audio is reaching the recorder."
-              )
-            );
+          else {
+            const where = p.label ? " via " + p.label : "";
+            const range = this._bufferRange();
+            let why;
+            if (!this.chunks.length) why = "no audio reached the recorder" + where;
+            else if (this.maxPeak < 0.0005)
+              why = "the recorder" + where + " received only silence";
+            else
+              why =
+                "timed out capturing audio" +
+                where +
+                " — wanted " +
+                p.start.toFixed(1) +
+                "-" +
+                p.end.toFixed(1) +
+                "s, recorded " +
+                (range ? range.first.toFixed(1) + "-" + range.last.toFixed(1) + "s" : "nothing");
+            p.reject(new Error(why));
+          }
           return false;
         }
         return true;
