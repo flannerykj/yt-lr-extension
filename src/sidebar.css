@@ -56,6 +56,21 @@ html.ylr-push.ylr-open body {
 html.ylr-push.ylr-open {
   overflow-x: hidden;
 }
+/* Our own panels are anchored from the LEFT in viewport units while the page is
+   narrowed, never from the right. Some sites (Prime Video) make <body> a
+   containing block for fixed descendants — a transform or filter somewhere in
+   their stylesheet is enough — and `right: 0` then means the right edge of the
+   *narrowed body*, which parks the sidebar in the middle of the screen. A left
+   offset is immune: narrowing moves body's right edge, never its left, so
+   `100vw - width` lands correctly either way. */
+html.ylr-push.ylr-open #ylr-sidebar {
+  left: calc(100vw - var(--ylr-width));
+  right: auto;
+}
+html.ylr-push.ylr-open #ylr-toggle {
+  left: calc(100vw - var(--ylr-width) - 56px);
+  right: auto;
+}
 
 .ylr-head {
   display: flex;

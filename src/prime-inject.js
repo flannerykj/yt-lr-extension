@@ -4,7 +4,7 @@
 // deep-scan anything that looks like that document, and post the tracks to the
 // content script. Also handles seeking.
 (function () {
-  console.log("[YLR] prime-inject loaded — build 13");
+  console.log("[YLR] prime-inject loaded — build 15");
   const origParse = JSON.parse;
   const originalFetch = window.fetch;
   let cached = null; // { tracks, mediaId, title }

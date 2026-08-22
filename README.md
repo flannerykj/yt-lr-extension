@@ -154,6 +154,13 @@ jumps back, records the line as it goes past, and returns the playhead. You hear
 that happen; there is no way around it, because the only readable copy of DRM'd
 audio is the one coming out of the speakers.
 
+## Documentation
+
+`docs/` explains how the audio side works from first principles — streaming video
+and DRM, the three capture routes, the AudioWorklet ring buffer, and the Netflix
+fetch-and-decode pipeline with its open questions. Start at
+[docs/README.md](docs/README.md).
+
 ## How it works
 
 **Architecture**: a shared, site-agnostic `core.js` (sidebar UI, state, starring,

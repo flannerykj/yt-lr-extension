@@ -5,7 +5,7 @@
 (function () {
   // Bump with every change to this file: the boot line is how we tell whether a
   // tab is running current code or a stale injection from before a reload.
-  console.log("[YLR] netflix-inject loaded — build 13");
+  console.log("[YLR] netflix-inject loaded — build 15");
   const origParse = JSON.parse;
   const originalFetch = window.fetch;
   // Netflix prefetches the NEXT episode's manifest a few minutes before the
@@ -161,6 +161,33 @@
     return String(Number(n)).padStart(2, "0");
   }
 
+  function digitsIn(value) {
+    const m = String(value == null ? "" : value).match(/(\d+)/);
+    return m ? Number(m[1]) : null;
+  }
+
+  // Netflix does not name the season number consistently — some titles carry it
+  // on the season, some on the episode, some only in a label like "Temporada 2".
+  let seasonFieldsLogged = false;
+  function seasonNumberOf(season, episode, video) {
+    const direct = [
+      season.seq,
+      season.seasonNumber,
+      season.number,
+      episode.seasonNumber,
+      video.seasonNumber
+    ];
+    for (const value of direct) if (typeof value === "number") return value;
+    const labelled =
+      digitsIn(season.shortName) || digitsIn(season.longName) || digitsIn(season.title);
+    if (labelled) return labelled;
+    if (!seasonFieldsLogged) {
+      seasonFieldsLogged = true;
+      console.log("[YLR] no season number; season fields:", Object.keys(season).join(","));
+    }
+    return null;
+  }
+
   let metadataLogged = false;
 
   function videoMetadata(movieId) {
@@ -210,10 +237,10 @@
       for (const episode of season.episodes || []) {
         if (String(episode.id) !== String(video.currentEpisode)) continue;
         const parts = [show];
-        if (episode.seq != null)
-          parts.push(
-            (season.seq != null ? "S" + pad(season.seq) : "") + "E" + pad(episode.seq)
-          );
+        const seasonNo = seasonNumberOf(season, episode, video);
+        const episodeNo = typeof episode.seq === "number" ? episode.seq : digitsIn(episode.seq);
+        if (episodeNo != null)
+          parts.push((seasonNo != null ? "S" + pad(seasonNo) : "") + "E" + pad(episodeNo));
         if (episode.title && episode.title !== show) parts.push(episode.title);
         return parts.filter(Boolean).join(" - ");
       }

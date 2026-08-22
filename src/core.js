@@ -47,6 +47,8 @@
   let pushPage = true; // narrow the page instead of covering it
   let hidePlayerCaptions = true; // the sidebar shows the same line
   let resizeTimer = null;
+  let verifyTimer = null;
+  let pushBroken = false; // this page's layout can't take being narrowed
   let lastLayout = "";
   let directAudioFailed = false; // fetching the audio outright stopped working
   let lastDirectError = "";
@@ -422,7 +424,7 @@
   // ignores our layout anyway.
   function applyLayout() {
     const html = document.documentElement;
-    const push = pushPage && !document.fullscreenElement;
+    const push = pushPage && !pushBroken && !document.fullscreenElement;
     html.classList.toggle("ylr-push", push);
     html.classList.toggle("ylr-hidecc", hidePlayerCaptions);
     const open = html.classList.contains("ylr-open");
@@ -439,6 +441,29 @@
     if (key === lastLayout) return;
     lastLayout = key;
     notifyResize();
+    clearTimeout(verifyTimer);
+    verifyTimer = setTimeout(verifyLayout, 400); // after the slide-in transition
+  }
+
+  // Narrowing the page is cosmetic; a sidebar parked in the middle of the screen
+  // is not. Sites vary in ways CSS can't fully anticipate — Prime Video makes
+  // <body> a containing block for fixed elements, which moves what `right` means
+  // — so check the result and give up on this page if it went wrong.
+  function verifyLayout() {
+    const html = document.documentElement;
+    if (!els || !html.classList.contains("ylr-push") || !html.classList.contains("ylr-open"))
+      return;
+    const r = els.root.getBoundingClientRect();
+    if (!r.width || Math.abs(r.right - window.innerWidth) <= 2) return;
+    console.log(
+      "[YLR] push mode misplaced the sidebar (right edge at " +
+        Math.round(r.right) +
+        " of " +
+        window.innerWidth +
+        "px) — overlaying this site instead"
+    );
+    pushBroken = true;
+    applyLayout();
   }
 
   // Players size themselves in JS off a resize event rather than off CSS, so
@@ -634,6 +659,17 @@
     els.list.innerHTML = "";
     els.list.appendChild(frag);
     applyFilter();
+    // The rows were just replaced, so the playing line lost its marker and its
+    // position. Re-apply it once layout has settled — without this the first
+    // scroll-to-active after a track loads lands on stale geometry, or never
+    // happens at all because tick() sees the index as unchanged.
+    if (state.activeIndex >= 0) {
+      const idx = state.activeIndex;
+      state.activeIndex = -1;
+      requestAnimationFrame(() => {
+        if (state.activeIndex === -1) setActive(idx);
+      });
+    }
   }
 
   // ---- filtering ----
@@ -1157,9 +1193,29 @@
     updateJumpButtons();
   }
 
+  // How many lines of context to keep on screen either side of the playing one.
+  const CONTEXT_ROWS = 2;
+
+  function rowFor(idx) {
+    return els ? els.list.querySelector(`.ylr-seg[data-index="${idx}"]`) : null;
+  }
+
   function activeRow() {
     if (state.activeIndex < 0 || !els) return null;
-    return els.list.querySelector(`.ylr-seg[data-index="${state.activeIndex}"]`);
+    return rowFor(state.activeIndex);
+  }
+
+  // The row `delta` places away from idx, counting only rows the filter is
+  // showing — a hidden row occupies no space, so it is no use as context.
+  function contextRow(idx, delta) {
+    if (!els) return null;
+    const rows = Array.prototype.filter.call(
+      els.list.querySelectorAll(".ylr-seg"),
+      (r) => !isFilteredOut(r)
+    );
+    const pos = rows.findIndex((r) => Number(r.dataset.index) === idx);
+    if (pos < 0) return null;
+    return rows[Math.min(rows.length - 1, Math.max(0, pos + delta))] || null;
   }
 
   // "above" = playing line is scrolled off the top (user is reading ahead);
@@ -1193,10 +1249,29 @@
       els.jump.textContent = (vis === "above" ? "↑" : "↓") + " Now playing";
   }
 
+  // Follow once there are fewer than CONTEXT_ROWS lines still fully visible below
+  // the playing one, rather than waiting for it to fall off the edge — so there
+  // is always some lookahead on screen.
+  function needsFollow(row, idx) {
+    if (!rowFullyVisible(row)) return true;
+    const trailing = contextRow(idx, CONTEXT_ROWS);
+    return !!trailing && trailing !== row && !rowFullyVisible(trailing);
+  }
+
+  // Scrolls so CONTEXT_ROWS lines sit above the playing one, leaving it near the
+  // top with context on both sides rather than pinned to the edge.
+  function scrollToActive(idx) {
+    const row = rowFor(idx);
+    if (!row || isFilteredOut(row)) return;
+    const lead = contextRow(idx, -CONTEXT_ROWS) || row;
+    // A line that is entirely off screen is a jump, not a nudge; animating it
+    // drags the whole list past the reader for no benefit.
+    const offscreen = rowVisibility(row) !== "visible";
+    lead.scrollIntoView({ block: "start", behavior: offscreen ? "auto" : "smooth" });
+  }
+
   function jumpToActive() {
-    const row = activeRow();
-    if (row && !isFilteredOut(row))
-      row.scrollIntoView({ block: "start", behavior: "smooth" });
+    scrollToActive(state.activeIndex);
     autoFollow = true;
     updateJumpButtons();
   }
@@ -1224,18 +1299,17 @@
     const row = els.list.querySelector(`.ylr-seg[data-index="${idx}"]`);
     if (!row) return;
     row.classList.add("ylr-current");
-    // Once the playing line runs off the edge, pull it back to the top so the
-    // upcoming lines fill the panel. Only when the previous line was on screen —
-    // otherwise the user has scrolled away and we leave them alone.
+    // Only follow when the previous line was on screen — otherwise the user has
+    // scrolled away and we leave them alone.
     if (
       autoFollow &&
       !interacting() &&
       activeTab === "subs" &&
       prevWasOnScreen &&
       !isFilteredOut(row) &&
-      !rowFullyVisible(row)
+      needsFollow(row, idx)
     )
-      row.scrollIntoView({ block: "start" });
+      scrollToActive(idx);
     updateJumpButtons();
   }
 
@@ -1380,7 +1454,11 @@
     els.tip.hidden = false;
     const r = row.getBoundingClientRect();
     els.tip.style.top = Math.max(8, r.top) + "px";
-    els.tip.style.right = window.innerWidth - r.left + 8 + "px";
+    // Placed from the left for the same reason as the sidebar: `right` can mean
+    // the edge of a narrowed <body> rather than of the viewport. Needs the width,
+    // so it is measured after being shown.
+    els.tip.style.right = "auto";
+    els.tip.style.left = Math.max(8, r.left - 8 - els.tip.offsetWidth) + "px";
   }
 
   function hideTip() {
@@ -1875,6 +1953,7 @@
 
   function enterPlayer() {
     const fresh = adapter.currentMediaId() !== state.mediaId;
+    pushBroken = false;
     showPlayerUI();
     if (fresh) resetMedia();
     // A stream tap survives the player closing, but the element its chunks are

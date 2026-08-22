@@ -56,8 +56,23 @@
     return normalizeEpisode(parts.join(" - "));
   }
 
+  const EPISODE_ONLY = /(^|[\s\-\u2013])E(\d+)\b/i;
+
+  // "Show - E06 - Name" means the metadata knew the episode but not its season.
+  // The player's title bar usually does, so borrow the number from there rather
+  // than shipping a filename that can't be told apart from another season's.
+  function withSeason(title) {
+    if (EPISODE_MARK.test(title) || !EPISODE_ONLY.test(title)) return title;
+    const season = domTitle().match(/\bS(?:eason|erie|eries|T|Temporada)?\s*[:.]?\s*(\d+)/i);
+    if (!season) return title;
+    return title.replace(
+      EPISODE_ONLY,
+      (all, before, ep) => before + "S" + pad(season[1]) + "E" + pad(ep)
+    );
+  }
+
   function bestTitle(fromInjector) {
-    const given = normalizeEpisode((fromInjector || "").trim());
+    const given = withSeason(normalizeEpisode((fromInjector || "").trim()));
     if (EPISODE_MARK.test(given)) return given;
     const dom = domTitle();
     if (dom && EPISODE_MARK.test(dom)) return dom;
