@@ -61,13 +61,66 @@
     return tracks;
   }
 
+  function pad(n) {
+    return (n < 10 ? "0" : "") + n;
+  }
+
+  // The numbers usually sit on the episode's own catalog entry, but on some
+  // responses only its season/series ancestors carry them.
+  function findNumbers(node, depth, out) {
+    if (!node || typeof node !== "object" || depth > 6) return out;
+    if (out.season == null && typeof node.seasonNumber === "number")
+      out.season = node.seasonNumber;
+    if (out.episode == null && typeof node.episodeNumber === "number")
+      out.episode = node.episodeNumber;
+    for (const k in node) {
+      const v = node[k];
+      if (v && typeof v === "object") findNumbers(v, depth + 1, out);
+    }
+    return out;
+  }
+
+  function findShow(node, depth) {
+    if (!node || typeof node !== "object" || depth > 6) return "";
+    const kind = String(node.entityType || node.type || "").toLowerCase();
+    if (node.title && /show|series/.test(kind) && !/season/.test(kind)) return node.title;
+    for (const k in node) {
+      const v = node[k];
+      if (v && typeof v === "object") {
+        const found = findShow(v, depth + 1);
+        if (found) return found;
+      }
+    }
+    return "";
+  }
+
+  // "Series - S01E03 - Episode title", so a downloaded file names the episode it
+  // came from rather than just the season it belongs to.
   function titleOf(node) {
-    const cat = node.catalogMetadata && node.catalogMetadata.catalog;
-    if (!cat) return document.title.replace(/^Prime Video:?\s*/i, "").trim();
-    let t = cat.title || "";
-    if (cat.seasonNumber != null && cat.episodeNumber != null)
-      t = t + " (S" + cat.seasonNumber + "E" + cat.episodeNumber + ")";
-    return t || document.title;
+    const cm = node.catalogMetadata;
+    const pageTitle = document.title.replace(/^Prime Video:?\s*/i, "").trim();
+    if (!cm) return pageTitle;
+    const cat = cm.catalog || {};
+    const nums = {
+      season: typeof cat.seasonNumber === "number" ? cat.seasonNumber : null,
+      episode: typeof cat.episodeNumber === "number" ? cat.episodeNumber : null
+    };
+    if (nums.season == null || nums.episode == null) findNumbers(cm, 0, nums);
+
+    const show = findShow(cm, 0);
+    const parts = [];
+    if (show) parts.push(show);
+    if (nums.episode != null)
+      parts.push((nums.season != null ? "S" + pad(nums.season) : "") + "E" + pad(nums.episode));
+    if (cat.title && cat.title !== show) parts.push(cat.title);
+    const out = parts.join(" - ").trim();
+    console.log(
+      "[YLR] Prime title:",
+      JSON.stringify(out),
+      "| catalog keys:",
+      Object.keys(cat).join(",")
+    );
+    return out || cat.title || pageTitle;
   }
 
   function idOf(node) {
@@ -78,10 +131,35 @@
     return m ? m[1] : location.pathname;
   }
 
+  // Prime's playback resources also point at the DASH manifests for the feature
+  // itself. Whether the *audio* adaptation set inside them is encrypted decides
+  // whether clips can be fetched and decoded directly, the way Language Reactor
+  // does it on Netflix, instead of recorded off the speakers.
+  function collectManifests(node) {
+    const urls = [];
+    const seen = new Set();
+    const walk = (n, depth) => {
+      if (!n || typeof n !== "object" || depth > 7 || urls.length >= 4) return;
+      const u = n.url || n.URL;
+      if (typeof u === "string" && /\.mpd|\/dash\/|\.m3u8/i.test(u) && !seen.has(u)) {
+        seen.add(u);
+        urls.push(u);
+      }
+      for (const k in n) {
+        const v = n[k];
+        if (v && typeof v === "object") walk(v, depth + 1);
+      }
+    };
+    walk(node.audioVideoUrls || node, 0);
+    return urls;
+  }
+
   function handleResources(node) {
     const tracks = collectTracks(node);
     if (!tracks.length) return false;
-    cached = { tracks, mediaId: idOf(node), title: titleOf(node) };
+    const manifests = collectManifests(node);
+    console.log("[YLR] Prime media manifests:", manifests.length, manifests[0] || "(none found)");
+    cached = { tracks, manifests, mediaId: idOf(node), title: titleOf(node) };
     console.log(
       "[YLR] Prime subtitle tracks:",
       tracks.map((t) => t.languageCode + "/" + t.kind).join(", "),

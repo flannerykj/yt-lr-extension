@@ -6,6 +6,8 @@
   "permissions": ["storage", "tabCapture"],
   "host_permissions": [
     "*://*.youtube.com/*",
+    "*://*.netflix.com/*",
+    "*://*.nflxvideo.net/*",
     "*://*.primevideo.com/*",
     "*://*.amazon.com/*",
     "*://*.media-amazon.com/*",
@@ -27,11 +29,35 @@
       "matches": ["*://www.youtube.com/*"],
       "js": [
         "src/db.js",
+        "src/settings.js",
         "src/captions.js",
         "src/audio.js",
         "src/library.js",
         "src/clip-extractor.js",
         "src/youtube.js",
+        "src/core.js"
+      ],
+      "css": ["src/sidebar.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["*://www.netflix.com/*"],
+      "js": ["src/netflix-inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://www.netflix.com/*"],
+      "js": [
+        "src/db.js",
+        "src/settings.js",
+        "src/captions.js",
+        "src/audio.js",
+        "src/library.js",
+        "src/mp4.js",
+        "src/clip-extractor.js",
+        "src/netflix.js",
         "src/core.js"
       ],
       "css": ["src/sidebar.css"],
@@ -48,6 +74,7 @@
       "matches": ["*://www.primevideo.com/*", "*://www.amazon.com/gp/video/*"],
       "js": [
         "src/db.js",
+        "src/settings.js",
         "src/captions.js",
         "src/audio.js",
         "src/library.js",
@@ -62,7 +89,12 @@
   "web_accessible_resources": [
     {
       "resources": ["src/pcm-worklet.js", "src/library-view.js"],
-      "matches": ["*://*.youtube.com/*", "*://*.primevideo.com/*", "*://*.amazon.com/*"]
+      "matches": [
+        "*://*.youtube.com/*",
+        "*://*.netflix.com/*",
+        "*://*.primevideo.com/*",
+        "*://*.amazon.com/*"
+      ]
     }
   ]
 }

@@ -92,7 +92,14 @@
       const from0 = Math.max(0, start - pad.lead);
       const res = await this.adapter.audioSegments(from0, end + pad.tail);
       const ctx = this._decodeCtx || (this._decodeCtx = new AudioContext());
-      const audio = await ctx.decodeAudioData(res.buffer);
+      let audio;
+      try {
+        audio = await ctx.decodeAudioData(res.buffer);
+      } catch (e) {
+        if (!res.fallbackBuffer) throw e;
+        console.log("[YLR] primary decode failed (" + e.message + "); trying the raw container");
+        audio = await ctx.decodeAudioData(res.fallbackBuffer);
+      }
       const rate = audio.sampleRate;
       const from = Math.max(0, Math.round((from0 - res.t0) * rate));
       const to = Math.min(audio.length, Math.round((end + pad.tail - res.t0) * rate));
@@ -128,6 +135,7 @@
           console.log("[YLR] segment extraction failed:", e.message);
         }
       }
+      if (!this.adapter.audioSource) throw segErr || new Error("no audio source");
       try {
         return await this.extractByReplay(mediaId, start, end);
       } catch (e) {

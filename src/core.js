@@ -33,6 +33,19 @@
   let followTimer = null;
   let menuRange = null;
 
+  // Player time minus subtitle time. Ad-supported Prime streams stitch ad breaks
+  // into the same timeline the <video> element reports, but the subtitle file
+  // only covers the feature, so the two drift apart by the ads played so far.
+  let syncOffset = 0;
+  let syncMode = "auto"; // "auto" = follow the player's own captions; "manual"
+  let filterQuery = "";
+  let filterShown = 0;
+  let inPlayer = false;
+  let wordHighlight = false; // karaoke highlight, off unless switched on
+  let lastAudioOk = null;
+  let audioNoteDismissed = false;
+  let directAudioFailed = false; // fetching the audio outright stopped working
+
   function video() {
     return adapter.getVideo();
   }
@@ -40,6 +53,16 @@
   function liveTime() {
     const v = video();
     return v ? v.currentTime : NaN;
+  }
+
+  // Where we are in the subtitle file, as opposed to in the stream.
+  function contentTime() {
+    const t = liveTime();
+    return Number.isNaN(t) ? t : t - syncOffset;
+  }
+
+  function seekTo(contentSeconds) {
+    adapter.seek(contentSeconds + syncOffset);
   }
 
   function trackKey(t) {
@@ -50,6 +73,10 @@
 
   function onTracks(payload) {
     if (!payload.tracks || !payload.tracks.length) return;
+    if (!inPlayer) {
+      if (!adapter.isWatchPage()) return; // a late reply after the player closed
+      showPlayerUI();
+    }
     const isNew = payload.mediaId !== state.mediaId;
     state.tracks = payload.tracks;
     state.mediaId = payload.mediaId;
@@ -57,7 +84,8 @@
     ensureUI();
     populateLangSelect();
     bindTimeupdate();
-    if (isNew || !state.track) selectTrack(adapter.defaultTrack(payload.tracks));
+    if (isNew || !state.track || !state.segments.length)
+      selectTrack(adapter.defaultTrack(payload.tracks));
   }
 
   function onTranslation(payload) {
@@ -94,6 +122,8 @@
     state.translation = [];
     if (els) {
       els.lang.value = trackKey(track);
+      els.search.value = "";
+      filterQuery = "";
       els.list.innerHTML = '<div class="ylr-note">Loading subtitles…</div>';
     }
     try {
@@ -101,6 +131,7 @@
       if (state.track !== track) return; // a newer selection superseded this one
       state.segments = segments || [];
       state.activeIndex = -1;
+      startSync();
       renderSegments();
       loadSavedRanges();
     } catch (e) {
@@ -123,6 +154,7 @@
         <div class="ylr-tabs">
           <button class="ylr-tab ylr-active" data-tab="subs">Subtitles</button>
           <button class="ylr-tab" data-tab="saved">Saved</button>
+          <button class="ylr-tab" data-tab="settings">Settings</button>
         </div>
         <div class="ylr-head-right">
           <button class="ylr-audio" title="Audio capture">🎙</button>
@@ -131,17 +163,51 @@
         </div>
       </div>
       <div class="ylr-subbar" hidden>
-        <span class="ylr-subbar-count"></span>
-        <span class="ylr-subbar-dl">
-          <span class="ylr-subbar-label">Download all</span>
-          <button class="ylr-link" data-fmt="txt">TXT</button>
-          <button class="ylr-link" data-fmt="srt">SRT</button>
-          <button class="ylr-link" data-fmt="json">JSON</button>
-        </span>
+        <div class="ylr-subbar-row">
+          <input type="search" class="ylr-search" placeholder="Filter subtitles…" spellcheck="false">
+        </div>
+        <div class="ylr-subbar-row">
+          <span class="ylr-subbar-count"></span>
+          <span class="ylr-subbar-dl">
+            <span class="ylr-subbar-label">Download all</span>
+            <button class="ylr-link" data-fmt="txt">TXT</button>
+            <button class="ylr-link" data-fmt="srt">SRT</button>
+            <button class="ylr-link" data-fmt="json">JSON</button>
+          </span>
+        </div>
+        <div class="ylr-subbar-row ylr-sync" hidden>
+          <span class="ylr-sync-state"></span>
+          <span class="ylr-sync-btns">
+            <button class="ylr-link ylr-sync-pick" title="Click this, then click the line being spoken right now">⌖ Set</button>
+            <button class="ylr-link" data-nudge="-0.25" title="Subtitles 0.25s later">−</button>
+            <button class="ylr-link" data-nudge="0.25" title="Subtitles 0.25s earlier">+</button>
+            <button class="ylr-link ylr-sync-reset" title="Go back to following the player's own captions">Auto</button>
+          </span>
+        </div>
       </div>
+      <div class="ylr-audio-note" hidden>
+        <b>Audio capture is off.</b> Starring saves a real audio clip, and this
+        site's audio is DRM-protected — so it has to be recorded from the tab.
+        Click this extension's icon in the Chrome toolbar once to switch it on for
+        this tab.
+        <button class="ylr-icon ylr-audio-dismiss" title="Dismiss">✕</button>
+      </div>
+      <div class="ylr-capture-status" hidden></div>
       <div class="ylr-body">
         <div class="ylr-list" data-panel="subs"></div>
         <div class="ylr-saved" data-panel="saved" hidden></div>
+        <div class="ylr-settings" data-panel="settings" hidden>
+          <div class="ylr-set-group">
+            <label class="ylr-set-check">
+              <input id="ylr-set-word" type="checkbox">
+              <span>Highlight the word being spoken</span>
+            </label>
+            <div class="ylr-set-hint">
+              Paints each word yellow as it is said. With this off, the line being
+              spoken is still shaded — only the word-by-word highlight goes away.
+            </div>
+          </div>
+        </div>
       </div>
       <button class="ylr-jump" hidden>↑ Now playing</button>`;
     document.body.appendChild(root);
@@ -176,10 +242,18 @@
       audio: root.querySelector(".ylr-audio"),
       lang: root.querySelector(".ylr-lang"),
       body: root.querySelector(".ylr-body"),
+      audioNote: root.querySelector(".ylr-audio-note"),
+      captureStatus: root.querySelector(".ylr-capture-status"),
       subbar: root.querySelector(".ylr-subbar"),
       subbarCount: root.querySelector(".ylr-subbar-count"),
+      search: root.querySelector(".ylr-search"),
+      sync: root.querySelector(".ylr-sync"),
+      syncState: root.querySelector(".ylr-sync-state"),
+      syncPick: root.querySelector(".ylr-sync-pick"),
       list: root.querySelector('[data-panel="subs"]'),
       saved: root.querySelector('[data-panel="saved"]'),
+      settings: root.querySelector('[data-panel="settings"]'),
+      setWord: root.querySelector("#ylr-set-word"),
       jump: root.querySelector(".ylr-jump"),
       tabs: root.querySelectorAll(".ylr-tab"),
       menu,
@@ -188,9 +262,36 @@
       menuSave: menu.querySelector(".ylr-menu-save")
     };
     els.jump.addEventListener("click", jumpToActive);
+    // The mic pill still shows the state, so the banner only has to be seen once.
+    root.querySelector(".ylr-audio-dismiss").addEventListener("click", () => {
+      audioNoteDismissed = true;
+      updateAudioStatus();
+    });
+    els.search.addEventListener("input", applyFilter);
+    els.search.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      els.search.value = "";
+      applyFilter();
+    });
     els.subbar.querySelectorAll("[data-fmt]").forEach((b) =>
       b.addEventListener("click", () => downloadTranscript(b.dataset.fmt, b))
     );
+    els.subbar.querySelectorAll("[data-nudge]").forEach((b) =>
+      b.addEventListener("click", () =>
+        applyOffset(syncOffset + Number(b.dataset.nudge), "manual")
+      )
+    );
+    els.syncPick.addEventListener("click", () =>
+      armPick(!els.list.classList.contains("ylr-picking"))
+    );
+    root.querySelector(".ylr-sync-reset").addEventListener("click", () => {
+      armPick(false);
+      lockedAt = 0;
+      pendingOffset = null;
+      applyOffset(0, "auto");
+      startSync();
+    });
     els.menuSave.addEventListener("click", onMenuSave);
     menu.querySelector(".ylr-menu-close").addEventListener("click", hideMenu);
     // On document so a drag that ends on the row padding still counts, but only
@@ -230,6 +331,30 @@
     els.tabs.forEach((tab) =>
       tab.addEventListener("click", () => switchTab(tab.dataset.tab))
     );
+    initSettingsPanel();
+  }
+
+  // ---- Settings tab ----
+
+  function initSettingsPanel() {
+    NS.settings.ready.then(showSettings);
+    NS.settings.onChange(showSettings);
+    els.setWord.addEventListener("change", () => {
+      applyWordHighlight(els.setWord.checked);
+      NS.settings.set({ wordHighlight: els.setWord.checked }).catch((e) => {
+        console.log("[YLR] could not save settings:", e.message);
+      });
+    });
+  }
+
+  function showSettings(s) {
+    if (els) els.setWord.checked = !!s.wordHighlight;
+    applyWordHighlight(!!s.wordHighlight);
+  }
+
+  function applyWordHighlight(on) {
+    wordHighlight = on;
+    if (!on && els) clearPaintedWord();
   }
 
   function setOpen(open) {
@@ -247,7 +372,10 @@
     els.tabs.forEach((t) => t.classList.toggle("ylr-active", t.dataset.tab === name));
     els.list.hidden = name !== "subs";
     els.saved.hidden = name !== "saved";
-    if (name === "saved") {
+    els.settings.hidden = name !== "settings";
+    if (name === "settings") {
+      els.body.scrollTop = scrollPos.settings || 0;
+    } else if (name === "saved") {
       els.body.scrollTop = scrollPos.saved || 0;
       renderSaved()
         .then(() => {
@@ -377,7 +505,7 @@
       play.title = "Play from here";
       play.addEventListener("click", (e) => {
         e.stopPropagation();
-        adapter.seek(seg.start);
+        seekTo(seg.start);
       });
 
       const text = document.createElement("div");
@@ -417,6 +545,53 @@
     });
     els.list.innerHTML = "";
     els.list.appendChild(frag);
+    applyFilter();
+  }
+
+  // ---- filtering ----
+
+  // Accent-folded as well as lower-cased: someone studying Spanish will type
+  // "como" and mean "cómo".
+  function fold(str) {
+    return (str || "")
+      .normalize("NFD")
+      .replace(/\p{Diacritic}/gu, "")
+      .toLowerCase();
+  }
+
+  function foldedText(seg) {
+    if (seg._fold == null) seg._fold = fold(seg.text);
+    return seg._fold;
+  }
+
+  // Rows are hidden rather than removed: every other part of the sidebar
+  // addresses them by index (karaoke, the active line, saved-word marking), so
+  // the list has to stay whole.
+  function applyFilter() {
+    if (!els) return;
+    filterQuery = fold(els.search.value.trim());
+    for (const hit of els.list.querySelectorAll(".ylr-w-hit"))
+      hit.classList.remove("ylr-w-hit");
+    filterShown = 0;
+    const tokens = filterQuery ? filterQuery.split(/\s+/) : [];
+    for (const row of els.list.querySelectorAll(".ylr-seg")) {
+      const seg = state.segments[Number(row.dataset.index)];
+      const match = !filterQuery || (seg && foldedText(seg).indexOf(filterQuery) !== -1);
+      row.classList.toggle("ylr-filtered", !match);
+      if (!match) continue;
+      filterShown++;
+      if (!tokens.length) continue;
+      for (const span of row.querySelectorAll(".ylr-w")) {
+        const word = fold(span.textContent);
+        if (tokens.some((t) => word.indexOf(t) !== -1)) span.classList.add("ylr-w-hit");
+      }
+    }
+    updateSubBar();
+    updateJumpButtons();
+  }
+
+  function isFilteredOut(row) {
+    return !!row && row.classList.contains("ylr-filtered");
   }
 
   // ---- whole-track download ----
@@ -430,7 +605,12 @@
     if (!on) return;
     const src = state.track ? adapter.trackLabel(state.track) : "";
     const tr = state.translation.length ? " → " + state.translationName : "";
-    els.subbarCount.textContent = state.segments.length + " lines · " + src + tr;
+    const lines = filterQuery
+      ? filterShown + " of " + state.segments.length
+      : String(state.segments.length);
+    els.subbarCount.textContent = lines + " lines · " + src + tr;
+    els.sync.hidden = !adapter.syncable;
+    if (adapter.syncable) els.syncState.textContent = syncStateText();
   }
 
   function transcriptRows() {
@@ -462,7 +642,7 @@
 
   function transcriptHeader() {
     return [
-      state.title,
+      bestKnownTitle(),
       "Source: " + (state.track ? adapter.trackLabel(state.track) : "unknown"),
       "Translation: " +
         (state.translation.length ? state.translationName : "none loaded"),
@@ -500,7 +680,7 @@
   function buildJson(rows) {
     return JSON.stringify(
       {
-        title: state.title,
+        title: bestKnownTitle(),
         site: adapter.name,
         mediaId: adapter.currentMediaId(),
         url: adapter.clipUrl({ start: 0, end: 0 }),
@@ -535,6 +715,17 @@
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
 
+  // Some sites only know the real episode name once their player has settled, so
+  // ask for the freshest one at the moment the file is named.
+  function bestKnownTitle() {
+    if (adapter.currentTitle) {
+      const fresh = (adapter.currentTitle() || "").trim();
+      const weak = !state.title || /^netflix$/i.test(state.title);
+      if (fresh && (weak || fresh.length > state.title.length)) state.title = fresh;
+    }
+    return state.title;
+  }
+
   function downloadTranscript(fmt, btn) {
     const spec = FORMATS[fmt];
     if (!spec || !state.segments.length) return;
@@ -542,7 +733,7 @@
     try {
       const rows = transcriptRows();
       const name =
-        safeName(state.title || "subtitles") +
+        safeName(bestKnownTitle() || "subtitles", 120) +
         (state.track ? "." + state.track.languageCode : "") +
         "." +
         spec.ext;
@@ -554,6 +745,227 @@
       alert("Couldn't export the subtitles: " + e.message);
       btn.textContent = label;
     }
+  }
+
+  // ---- drift correction ----
+
+  // Ad breaks push the stream's clock ahead of the subtitle file's clock, so a
+  // fixed offset is wrong by the end of the first break. The player's own
+  // caption overlay always knows the truth, so we read the line it is currently
+  // showing, find that line in our list, and take the difference. Re-measured on
+  // every caption change, so each ad break is absorbed within a line or two.
+  let captionNode = null;
+  let captionObserver = null;
+  let captionIndex = null; // normalized cue text -> [segment index]
+  let lastCaptionText = "";
+  let pendingOffset = null;
+  let lockedAt = 0;
+  let scanTimer = null;
+  let scanMisses = 0;
+
+  function normText(str) {
+    return (str || "")
+      .replace(/\s+/g, " ")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N} ]/gu, "")
+      .trim();
+  }
+
+  function buildCaptionIndex() {
+    captionIndex = new Map();
+    state.segments.forEach((seg, i) => {
+      const key = normText(seg.text);
+      if (key.length < 4) return; // too short to identify a moment
+      if (!captionIndex.has(key)) captionIndex.set(key, []);
+      captionIndex.get(key).push(i);
+    });
+  }
+
+  function playerRoot() {
+    if (adapter.playerRoot) {
+      const r = adapter.playerRoot();
+      if (r) return r;
+    }
+    const v = video();
+    return (v && v.parentElement) || document.body;
+  }
+
+  // The overlay element is found by what it says, not by a class name: the one
+  // node under the player whose text is a line of the track we loaded.
+  // Our own sidebar, tooltip and save menu all repeat the subtitle text, so they
+  // must never be mistaken for the player's overlay.
+  function isOurs(el) {
+    return (
+      !!els &&
+      (els.root.contains(el) || els.menu.contains(el) || els.tip.contains(el))
+    );
+  }
+
+  function findCaptionNode() {
+    const root = playerRoot();
+    if (!root || !captionIndex || !captionIndex.size) return null;
+    for (const el of root.querySelectorAll("div, span, p")) {
+      if (isOurs(el) || el.children.length > 3) continue;
+      const key = normText(el.textContent);
+      if (!captionIndex.has(key)) continue;
+      // Climb to the outermost node that still says only this line — that's the
+      // overlay container, which survives the next cue.
+      let node = el;
+      while (
+        node.parentElement &&
+        node.parentElement !== root &&
+        !isOurs(node.parentElement) &&
+        normText(node.parentElement.textContent) === key
+      )
+        node = node.parentElement;
+      return node;
+    }
+    return null;
+  }
+
+  function measureFromCaption() {
+    if (!captionNode || !captionNode.isConnected) {
+      stopCaptionWatch();
+      return;
+    }
+    const key = normText(captionNode.textContent);
+    if (!key || key === lastCaptionText) return;
+    lastCaptionText = key;
+    const hits = captionIndex.get(key);
+    if (!hits || !hits.length) return;
+    const now = liveTime();
+    if (Number.isNaN(now)) return;
+    let pick = hits[0];
+    if (hits.length > 1) {
+      // A repeated line ("Sí.") only pins us down if we already know roughly
+      // where we are; otherwise it could mean any of a dozen moments.
+      let bestGap = Infinity;
+      for (const i of hits) {
+        const gap = Math.abs(state.segments[i].start - (now - syncOffset));
+        if (gap < bestGap) {
+          bestGap = gap;
+          pick = i;
+        }
+      }
+      if (bestGap > 60) return;
+    }
+    proposeOffset(now - state.segments[pick].start, hits.length === 1);
+  }
+
+  // A line that appears exactly once in the track pins the moment down on its
+  // own, so it corrects immediately — that's what gets the sidebar back in step
+  // on the first caption after an ad break. A repeated line has to be confirmed
+  // by a second reading that agrees.
+  function proposeOffset(measured, unique) {
+    if (Math.abs(measured - syncOffset) < 0.35) {
+      pendingOffset = null;
+      const wasCold = !lockedAt;
+      lockedAt = Date.now();
+      if (wasCold) updateSubBar();
+      return; // already in sync
+    }
+    if (unique || (pendingOffset !== null && Math.abs(pendingOffset - measured) < 0.75)) {
+      pendingOffset = null;
+      applyOffset(measured, "auto");
+      return;
+    }
+    pendingOffset = measured;
+  }
+
+  function applyOffset(value, mode) {
+    syncOffset = value;
+    syncMode = mode;
+    if (mode === "auto") lockedAt = Date.now();
+    state.activeIndex = -1;
+    tick();
+    updateSubBar();
+  }
+
+  function startCaptionWatch(node) {
+    stopCaptionWatch();
+    captionNode = node;
+    lastCaptionText = "";
+    captionObserver = new MutationObserver(measureFromCaption);
+    captionObserver.observe(node, { childList: true, subtree: true, characterData: true });
+    measureFromCaption();
+    console.log("[YLR] sync: watching the player's caption overlay");
+  }
+
+  function stopCaptionWatch() {
+    if (captionObserver) captionObserver.disconnect();
+    captionObserver = null;
+    captionNode = null;
+    lastCaptionText = "";
+  }
+
+  function scanForCaptions() {
+    if (syncMode !== "auto" || !state.segments.length) return;
+    if (captionNode && captionNode.isConnected) {
+      measureFromCaption(); // MutationObserver can miss a full subtree swap
+      return;
+    }
+    const node = findCaptionNode();
+    if (node) {
+      startCaptionWatch(node);
+      return;
+    }
+    if (++scanMisses === 20) updateSubBar(); // long enough to say why
+  }
+
+  function resetSync() {
+    stopCaptionWatch();
+    clearInterval(scanTimer);
+    scanTimer = null;
+    captionIndex = null;
+    pendingOffset = null;
+    scanMisses = 0;
+    lockedAt = 0;
+    syncOffset = 0;
+    syncMode = "auto";
+    if (els) armPick(false);
+  }
+
+  function startSync() {
+    if (!adapter.syncable) return;
+    buildCaptionIndex();
+    stopCaptionWatch();
+    pendingOffset = null;
+    scanMisses = 0;
+    if (!scanTimer) scanTimer = setInterval(scanForCaptions, 1000);
+  }
+
+  function syncStateText() {
+    if (!adapter.syncable) return "";
+    const sign = syncOffset >= 0 ? "+" : "−";
+    const amount = sign + Math.abs(syncOffset).toFixed(1) + "s";
+    if (syncMode === "manual") return "Sync: manual " + amount;
+    if (lockedAt) return "Sync: auto " + amount;
+    if (scanMisses >= 20)
+      return "Sync: turn the player's own subtitles on (same language), or set it below";
+    return "Sync: looking for the player's captions…";
+  }
+
+  // Manual fallback for when the player's captions are switched off: the user
+  // clicks the line being spoken right now and that becomes the anchor.
+  function armPick(on) {
+    if (!els) return;
+    els.list.classList.toggle("ylr-picking", on);
+    els.syncPick.classList.toggle("ylr-on", on);
+    els.syncPick.textContent = on ? "Click the line" : "⌖ Set";
+    if (on) els.list.addEventListener("click", onPickClick, true);
+    else els.list.removeEventListener("click", onPickClick, true);
+  }
+
+  function onPickClick(e) {
+    const row = e.target.closest && e.target.closest(".ylr-seg");
+    e.preventDefault();
+    e.stopPropagation();
+    armPick(false);
+    if (!row) return;
+    const seg = state.segments[Number(row.dataset.index)];
+    const now = liveTime();
+    if (!seg || Number.isNaN(now)) return;
+    applyOffset(now - seg.start, "manual");
   }
 
   // ---- playback sync ----
@@ -571,13 +983,18 @@
   function tick() {
     const v = video();
     if (!v || !state.segments.length) return;
-    const t = v.currentTime;
+    const t = contentTime();
     let idx = -1;
     for (let i = 0; i < state.segments.length; i++) {
       if (state.segments[i].start <= t + 0.05) idx = i;
       else break;
     }
     if (idx !== state.activeIndex) setActive(idx);
+    const ok = audioAvailable();
+    if (ok !== lastAudioOk) {
+      lastAudioOk = ok;
+      updateAudioStatus();
+    }
   }
 
   // ---- karaoke ----
@@ -588,13 +1005,17 @@
   function paintWord() {
     requestAnimationFrame(paintWord);
     if (!els || activeTab !== "subs") return;
+    if (!wordHighlight) {
+      if (painted.word >= 0) clearPaintedWord();
+      return;
+    }
     const v = video();
     const seg = state.segments[state.activeIndex];
     if (!v || !seg) {
       if (painted.word >= 0) clearPaintedWord();
       return;
     }
-    const t = v.currentTime;
+    const t = contentTime();
     const words = wordsOf(seg);
     let idx = -1;
     for (let i = 0; i < words.length; i++) {
@@ -665,7 +1086,8 @@
   }
 
   function activeVisibility() {
-    return rowVisibility(activeRow());
+    const row = activeRow();
+    return isFilteredOut(row) ? "none" : rowVisibility(row);
   }
 
   function rowFullyVisible(row) {
@@ -685,7 +1107,8 @@
 
   function jumpToActive() {
     const row = activeRow();
-    if (row) row.scrollIntoView({ block: "start", behavior: "smooth" });
+    if (row && !isFilteredOut(row))
+      row.scrollIntoView({ block: "start", behavior: "smooth" });
     autoFollow = true;
     updateJumpButtons();
   }
@@ -721,6 +1144,7 @@
       !interacting() &&
       activeTab === "subs" &&
       prevWasOnScreen &&
+      !isFilteredOut(row) &&
       !rowFullyVisible(row)
     )
       row.scrollIntoView({ block: "start" });
@@ -817,7 +1241,7 @@
   }
 
   function onListMouseUp(e) {
-    if (!els) return;
+    if (!els || els.list.classList.contains("ylr-picking")) return;
     noteInteraction(3000);
     const sel = window.getSelection();
     if (sel && sel.rangeCount && !sel.isCollapsed && els.list.contains(sel.anchorNode)) {
@@ -854,7 +1278,7 @@
       console.log("[YLR] save selection failed:", err.message);
       els.menuSave.disabled = false;
       els.menuSave.textContent = "★ Save audio";
-      alert("Couldn't save audio: " + err.message);
+      alert("Couldn't save that selection: " + err.message);
     }
   }
 
@@ -875,12 +1299,30 @@
     if (els) els.tip.hidden = true;
   }
 
+  // YouTube taps the element and needs no permission, so it never reports an
+  // audioEnabled state and never shows the banner.
+  function audioAvailable() {
+    return !adapter.audioEnabled || adapter.audioEnabled();
+  }
+
   function updateAudioStatus() {
     if (!els || !els.audio) return;
-    els.audio.classList.toggle("ylr-audio-on", audioReady);
-    els.audio.title = audioReady
+    const ok = audioAvailable();
+    els.audio.classList.toggle("ylr-audio-on", ok && audioReady);
+    els.audio.title = ok
       ? "Audio capture on"
       : "Audio capture off — click the extension's toolbar icon to enable";
+    els.audioNote.hidden =
+      ok ||
+      audioNoteDismissed ||
+      !adapter.audioEnabled ||
+      (!!adapter.audioSegments && !directAudioFailed);
+  }
+
+  function setCaptureStatus(text) {
+    if (!els) return;
+    els.captureStatus.textContent = text || "";
+    els.captureStatus.hidden = !text;
   }
 
   // ---- capture / save ----
@@ -890,6 +1332,10 @@
   // the ring buffer is filling as you watch and starring is instant.
   function onCaptureStream(stream) {
     console.log("[YLR] core: capture stream received, starting ring buffer");
+    updateAudioStatus();
+    // Granted from the detail page, before playback. Nothing to tag chunks
+    // against yet, so leave the buffer for enterPlayer to start.
+    if (!video()) return;
     if (!capture) capture = new NS.AudioCapture(video(), { bufferSeconds: 90, liveTime });
     capture
       .ensureFromStream(stream)
@@ -929,42 +1375,98 @@
     return extractor;
   }
 
-  // The live ring buffer is instant but only holds what has played through the
-  // tap. Anything else — a line ahead of the playhead, or one that has already
-  // scrolled out of the buffer — is re-recorded from the audio-only stream.
+  // Three ways to get the audio for a range, in order of preference:
+  //   1. Fetch and decode it directly (YouTube's own segments, Netflix's
+  //      unencrypted audio streams). Instant, needs no permission, doesn't
+  //      disturb playback.
+  //   2. Slice it out of the live ring buffer, if the tap is running and the
+  //      line has already played through it.
+  //   3. Play the range again and record it (DRM sites with no fetchable audio).
   async function clipFor(seg) {
-    try {
-      await ensureCapture();
-      console.log(
-        "[YLR] star: capturing",
-        seg.start.toFixed(2),
-        "-",
-        seg.end.toFixed(2),
-        "| ctx",
-        capture.ctx && capture.ctx.state
-      );
-      return await capture.capture(seg.start, seg.end, {
-        immediate: !!(adapter.audioSegments && ensureExtractor())
-      });
-    } catch (e) {
-      console.log("[YLR] live buffer miss:", e.message);
-      if (/no audio|cancelled|blocked|tap/i.test(e.message)) {
-        capture = null;
-        audioReady = false;
-        if (adapter.resetAudio) adapter.resetAudio();
+    const start = seg.start + syncOffset;
+    const end = seg.end + syncOffset;
+    const extractor = ensureExtractor();
+    const canFetch = !!(extractor && adapter.audioSegments);
+
+    if (!canFetch || audioReady) {
+      try {
+        await ensureCapture();
+        console.log(
+          "[YLR] star: capturing",
+          start.toFixed(2),
+          "-",
+          end.toFixed(2),
+          "| ctx",
+          capture.ctx && capture.ctx.state
+        );
+        return await capture.capture(start, end, { immediate: canFetch });
+      } catch (e) {
+        console.log("[YLR] live buffer miss:", e.message);
+        if (/no audio|cancelled|blocked|tap/i.test(e.message)) {
+          capture = null;
+          audioReady = false;
+          // A stale element only needs the capture rebuilt. Tearing down the
+          // tab-capture stream as well would cost another toolbar click for
+          // nothing — reserve that for a tap that genuinely carries no audio.
+          if (adapter.resetAudio && !/tap/i.test(e.message)) adapter.resetAudio();
+        }
+        if (!extractor && !(adapter.replayable && audioAvailable())) throw e;
       }
-      const ex = ensureExtractor();
-      if (!ex) throw e;
-      return await ex.extract(adapter.currentMediaId(), seg.start, seg.end);
+    }
+
+    if (extractor) {
+      try {
+        return await extractor.extract(adapter.currentMediaId(), start, end);
+      } catch (e) {
+        console.log("[YLR] direct extraction failed:", e.message);
+        directAudioFailed = true;
+        updateAudioStatus();
+        if (!(adapter.replayable && audioAvailable())) throw e;
+      }
+    }
+
+    if (adapter.replayable && audioAvailable()) return await replayCapture(seg);
+    throw new Error("no way to capture audio for that line");
+  }
+
+  // Everything the live buffer holds is what has already played through the tap.
+  // On a DRM site there is no second source to decode, so the only way to get a
+  // line that hasn't played (or has scrolled out of the buffer) is to play it:
+  // jump there, record it as it goes past, then put the playhead back.
+  async function replayCapture(range) {
+    await ensureCapture();
+    const v = video();
+    if (!v) throw new Error("the player isn't open");
+    const start = range.start + syncOffset;
+    const end = range.end + syncOffset;
+    const back = v.currentTime;
+    const wasPaused = v.paused;
+    setCaptureStatus(
+      "Replaying " + formatTime(range.start) + "–" + formatTime(range.end) + " to record it…"
+    );
+    capture.reset(); // stale tags must not satisfy the range we're about to fill
+    adapter.seek(Math.max(0, start - NS.CLIP_PAD.lead - 0.5));
+    try {
+      return await capture.capture(start, end, { waitForPlayback: true });
+    } finally {
+      setCaptureStatus("");
+      adapter.seek(back);
+      if (wasPaused) setTimeout(() => v.pause(), 250);
     }
   }
 
-  // One save path for all three ways in: starring a chunk, saving a selection,
-  // saving a single word. Every clip stores its text, its translation and the
-  // audio for exactly its own time range.
+  // The text, translation and timings are the point; the audio is a bonus. If
+  // capture fails the line is still saved, flagged so the Saved tab can say why.
   async function saveClip(range) {
-    const wav = await clipFor(range);
-    console.log("[YLR] got wav", wav && wav.size, "bytes");
+    let wav = null;
+    let audioError = null;
+    try {
+      wav = await clipFor(range);
+      console.log("[YLR] got wav", wav && wav.size, "bytes");
+    } catch (e) {
+      audioError = e.message || String(e);
+      console.log("[YLR] no audio for this clip:", audioError);
+    }
     const record = {
       id:
         adapter.currentMediaId() +
@@ -980,12 +1482,31 @@
       start: range.start,
       end: range.end,
       createdAt: Date.now(),
-      audio: wav
+      audio: wav,
+      audioError
     };
     await NS.db.add(record);
-    console.log("[YLR] saved", record.id);
+    // One line per save, so the outcome is findable without reading the whole log.
+    console.log(
+      "[YLR] SAVED " +
+        JSON.stringify((range.text || "").slice(0, 40)) +
+        " " +
+        range.start.toFixed(1) +
+        "-" +
+        range.end.toFixed(1) +
+        "s | audio: " +
+        (audioError ? "FAILED — " + audioError : Math.round((wav.size || 0) / 1024) + " KB")
+    );
     markSaved(range);
+    if (audioError) flashStatus("Saved text only — no audio: " + audioError);
     return record;
+  }
+
+  let statusTimer = null;
+  function flashStatus(text, ms = 6000) {
+    setCaptureStatus(text);
+    clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => setCaptureStatus(""), ms);
   }
 
   async function onStar(seg, starEl) {
@@ -997,7 +1518,7 @@
       starEl.textContent = "★";
     } catch (e) {
       console.log("[YLR] star failed:", e.message);
-      alert("Couldn't save audio: " + e.message);
+      alert("Couldn't save that line: " + e.message);
     } finally {
       starEl.classList.remove("ylr-capturing");
     }
@@ -1036,9 +1557,11 @@
       meta.textContent =
         clip.videoTitle + " · " + formatTime(clip.start) + "–" + formatTime(clip.end);
 
-      const audio = document.createElement("audio");
-      audio.controls = true;
-      audio.src = URL.createObjectURL(clip.audio);
+      const audio = clip.audio ? document.createElement("audio") : null;
+      if (audio) {
+        audio.controls = true;
+        audio.src = URL.createObjectURL(clip.audio);
+      }
 
       const actions = document.createElement("div");
       actions.className = "ylr-clip-actions";
@@ -1046,8 +1569,10 @@
       const dl = document.createElement("a");
       dl.className = "ylr-link";
       dl.textContent = "Download";
-      dl.href = audio.src;
-      dl.download = safeName(clip.text) + ".wav";
+      if (audio) {
+        dl.href = audio.src;
+        dl.download = safeName(clip.text) + ".wav";
+      }
 
       const open = document.createElement("a");
       open.className = "ylr-link";
@@ -1065,7 +1590,7 @@
         tick();
       });
 
-      actions.appendChild(dl);
+      if (audio) actions.appendChild(dl);
       actions.appendChild(open);
       actions.appendChild(del);
 
@@ -1083,7 +1608,13 @@
         card.appendChild(tr);
       }
       card.appendChild(meta);
-      card.appendChild(audio);
+      if (audio) card.appendChild(audio);
+      else {
+        const noAudio = document.createElement("div");
+        noAudio.className = "ylr-clip-noaudio";
+        noAudio.textContent = "Text only — " + (clip.audioError || "audio wasn't captured");
+        card.appendChild(noAudio);
+      }
       card.appendChild(actions);
       els.saved.appendChild(card);
     }
@@ -1145,32 +1676,85 @@
     return m + ":" + String(sec).padStart(2, "0");
   }
 
-  function safeName(text) {
-    return text.slice(0, 40).replace(/[^\p{L}\p{N} _-]/gu, "").trim() || "clip";
+  function safeName(text, max = 40) {
+    return text.slice(0, max).replace(/[^\p{L}\p{N} _-]/gu, "").trim() || "clip";
   }
 
   // ---- boot / navigation ----
 
-  function boot() {
-    if (!adapter.isWatchPage()) return;
+  // Everything tied to one title. Leaving the player throws it all away so that
+  // coming back re-fetches rather than showing the last video's lines.
+  function resetMedia() {
+    state.mediaId = null;
+    state.track = null;
+    state.tracks = [];
+    state.segments = [];
+    state.translation = [];
+    state.starred = new Set();
+    state.savedRanges = [];
+    state.activeIndex = -1;
+    painted = { seg: -1, word: -1 };
+    resetSync();
+    if (!els) return;
+    els.search.value = "";
+    filterQuery = "";
+    els.lang.innerHTML = "";
+    els.list.innerHTML = "";
+    updateSubBar();
+    updateJumpButtons();
+  }
+
+  function showPlayerUI() {
+    inPlayer = true;
     ensureUI();
-    if (!state.segments.length && els) {
-      els.list.innerHTML = '<div class="ylr-note">Loading subtitles…</div>';
+    setOpen(true);
+    els.toggle.hidden = false;
+  }
+
+  function enterPlayer() {
+    const fresh = adapter.currentMediaId() !== state.mediaId;
+    showPlayerUI();
+    if (fresh) resetMedia();
+    // A stream tap survives the player closing, but the element its chunks are
+    // time-tagged against does not.
+    const v = video();
+    if (capture && capture.captureStream && v && capture.video !== v) {
+      capture.video = v;
+      capture.reset();
     }
+    if (!capture && audioAvailable() && adapter.audioEnabled)
+      ensureCapture().catch((e) => console.log("[YLR] pre-warm audio:", e.message));
+    if (!state.segments.length)
+      els.list.innerHTML = '<div class="ylr-note">Loading subtitles…</div>';
     adapter.requestTracks();
   }
 
-  adapter.onNavigate(() => {
-    if (adapter.currentMediaId() !== state.mediaId) {
-      state.mediaId = null;
-      state.track = null;
-      state.segments = [];
-      state.translation = [];
-      state.starred = new Set();
-      state.savedRanges = [];
+  // The player closed — back to a browse or detail page. The sidebar and its
+  // handle both go away; the audio tap is left running, since re-creating one on
+  // the same <video> element isn't allowed and starring should work at once when
+  // the player comes back.
+  function exitPlayer() {
+    inPlayer = false;
+    hideMenu();
+    hideTip();
+    resetMedia();
+    if (!els) return;
+    setOpen(false);
+    els.toggle.hidden = true;
+  }
+
+  function checkLocation() {
+    if (!adapter.isWatchPage()) {
+      if (inPlayer) exitPlayer();
+      return;
     }
-    boot();
-  });
+    const id = adapter.currentMediaId();
+    // Only a confirmed switch to a different title re-enters; an id we don't
+    // know yet must not restart the load on every tick.
+    if (!inPlayer || (id && state.mediaId && id !== state.mediaId)) enterPlayer();
+  }
+
+  adapter.onNavigate(checkLocation);
 
   adapter.init({ onTracks, onTranslation, onCaptureStream });
 
@@ -1185,5 +1769,5 @@
     window.addEventListener("pointerdown", startOnce, { once: true, capture: true });
   }
 
-  boot();
+  checkLocation();
 })();
