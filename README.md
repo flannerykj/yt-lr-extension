@@ -156,10 +156,11 @@ audio is the one coming out of the speakers.
 
 ## Documentation
 
-`docs/` explains how the audio side works from first principles — streaming video
-and DRM, the three capture routes, the AudioWorklet ring buffer, and the Netflix
-fetch-and-decode pipeline with its open questions. Start at
-[docs/README.md](docs/README.md).
+[`docs/`](docs/README.md) covers the architecture — the two JavaScript worlds, the
+adapter contract, every message type — and, in
+[`docs/audio-extraction/`](docs/audio-extraction/), how the audio side works from
+first principles: streaming video and DRM, the three capture routes, the
+AudioWorklet ring buffer, and the Netflix fetch-and-decode pipeline.
 
 ## How it works
 
