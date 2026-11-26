@@ -7,9 +7,14 @@
   const NS = (window.YLR = window.YLR || {});
 
   // Subtitle start times land right on the first syllable, so a clip cut at the
-  // exact timestamp clips the attack. Lead in by a second; the tail only needs
-  // enough to avoid chopping the last word.
-  const PAD = { lead: 1.0, tail: 0.15 };
+  // exact timestamp loses the attack — but a full second of lead-in is dead air
+  // before the line starts. The tail matters more than it looks: cues tend to end
+  // on the last syllable, and trailing consonants and room tone run past it.
+  //
+  // The single source of truth: everything else reads NS.CLIP_PAD, including
+  // playFromBytes, which has to cancel this padding out to avoid applying it
+  // twice.
+  const PAD = { lead: 0.8, tail: 0.65 };
 
   function encodeWav(samples, sampleRate) {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -346,4 +351,11 @@
   NS.AudioCapture = AudioCapture;
   NS.encodeWav = encodeWav;
   NS.CLIP_PAD = PAD;
+
+  // Mutated in place rather than replaced: every reader holds this same object,
+  // so a new setting takes effect on the next clip without anything re-reading.
+  NS.setClipPad = function (lead, tail) {
+    if (Number.isFinite(lead)) PAD.lead = Math.max(0, Math.min(5, lead));
+    if (Number.isFinite(tail)) PAD.tail = Math.max(0, Math.min(5, tail));
+  };
 })();

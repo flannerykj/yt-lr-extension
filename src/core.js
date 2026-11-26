@@ -4,6 +4,14 @@
 (function () {
   const NS = (window.YLR = window.YLR || {});
   const adapter = NS.adapter;
+  // Logged before the guard below, and unconditionally: a silent early return
+  // here is indistinguishable from the isolated world never running at all.
+  console.log(
+    "[YLR] core " +
+      ((chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "?") +
+      " loading | adapter: " +
+      (adapter ? adapter.name : "NONE — the site file did not load")
+  );
   if (!adapter) return;
 
   const state = {
@@ -42,6 +50,9 @@
   let filterShown = 0;
   let inPlayer = false;
   let wordHighlight = false; // karaoke highlight, off unless switched on
+  let manualTrack = false; // did the viewer pick this track, or did we?
+  let translationOffset = 0; // how far the target track runs behind the source
+  let deepLinkTried = false;
   let pushPage = true; // narrow the page instead of covering it
   let hidePlayerCaptions = true; // the sidebar shows the same line
   let resizeTimer = null;
@@ -64,8 +75,47 @@
     return Number.isNaN(t) ? t : t - syncOffset;
   }
 
+  // The ▶ on a line means "play from here", so a paused player has to start.
+  // Adapters that set currentTime directly resume on their own; ones that go
+  // through a player API may not, and the seek is async there — hence the
+  // retries rather than a single check.
+  // A saved clip's link carries ?t=<seconds of player time>. YouTube honours its
+  // own `t` natively; Netflix and Prime are inconsistent about it, and the
+  // sidebar is running on the page the link just opened — so it does the seek
+  // itself rather than hoping. Once per media, and only if the player isn't
+  // already there (which it will be if the site did honour the parameter).
+  function applyDeepLink() {
+    if (deepLinkTried || adapter.name === "youtube") return;
+    const v = video();
+    if (!v || !state.segments.length) return; // not ready; try again on the next tick
+    deepLinkTried = true;
+    let target;
+    try {
+      target = Number(new URLSearchParams(location.search).get("t"));
+    } catch (e) {
+      return;
+    }
+    if (!Number.isFinite(target) || target <= 0) return;
+    if (Math.abs(v.currentTime - target) < 3) {
+      console.log("[YLR] deep link: already at", target + "s");
+      return;
+    }
+    console.log("[YLR] deep link: seeking to", target + "s (was", v.currentTime.toFixed(1) + "s)");
+    adapter.seek(target); // the link stores player time, so no offset to apply
+    ensurePlaying();
+  }
+
   function seekTo(contentSeconds) {
     adapter.seek(contentSeconds + syncOffset);
+    for (const delay of [0, 150, 500]) setTimeout(ensurePlaying, delay);
+  }
+
+  function ensurePlaying() {
+    const v = video();
+    if (!v || !v.paused) return;
+    const started = v.play();
+    if (started && started.catch)
+      started.catch((e) => NS.warn("could not start playback after a seek", e));
   }
 
   function trackKey(t) {
@@ -83,7 +133,12 @@
     const isNew = payload.mediaId !== state.mediaId;
     state.tracks = payload.tracks;
     state.mediaId = payload.mediaId;
-    state.title = payload.title || document.title;
+    const offered = usableTitle(payload.title);
+    const held = usableTitle(state.title);
+    if (offered && offered.length >= held.length) {
+      state.title = offered;
+      if (offered !== held) backfillClips();
+    }
     ensureUI();
     populateLangSelect();
     bindTimeupdate();
@@ -95,6 +150,7 @@
     if (payload.mediaId && payload.mediaId !== adapter.currentMediaId()) return;
     if (state.track && state.track.languageCode !== payload.lang) return;
     state.translation = payload.cues || [];
+    refreshTranslationOffset();
     state.translationLang = payload.targetLang || "en";
     state.translationName =
       payload.targetName ||
@@ -103,21 +159,139 @@
     updateSubBar();
   }
 
-  // Target-language text overlapping a segment's time range. Cues share the
-  // source timeline, so match by each cue's start falling inside the span.
+  // Target-language text for a segment's time range.
+  //
+  // The two subtitle files are authored separately and do not share cue
+  // boundaries: one English cue can span two Spanish ones, cues linger on screen
+  // after the speech, and start times differ by up to a second. So this matches
+  // on how much the two spans actually *overlap*, never on a start time landing
+  // inside a range — the previous line is usually still on screen when the next
+  // one begins, and matching by containment hands you that previous line.
+  //
+  // A cue counts if it covers a real part of this line, or if most of the cue
+  // itself belongs to this line. Nothing overlapping means no translation shown:
+  // a confidently wrong one is worse than a blank in a study tool.
+  // Two subtitle files for the same title are timed independently, and one
+  // usually runs a consistent fraction of a second behind the other — different
+  // subtitler, different conventions about when a cue should appear. That lag is
+  // what makes the previous line's translation show up against this line, and no
+  // amount of widening tolerances fixes it: the neighbour is genuinely closer.
+  // Measure the lag and subtract it, and the overlaps land where they should.
+  //
+  // The lag is measured *locally* rather than once for the whole title, because
+  // it is not always constant — a track authored against a different cut drifts
+  // apart over an episode. Each source line gets the median gap to the nearest
+  // target cue across its neighbourhood; the median throws out the lines that
+  // genuinely have no counterpart, which a mean would let drag the estimate
+  // around.
+  const OFFSET_WINDOW = 10; // lines either side to measure the local lag over
+  const OFFSET_LIMIT = 5; // a gap wider than this is a missing line, not lag
+  let offsetTable = null; // { times, offsets }, both ascending by time
+
+  function buildOffsetTable() {
+    offsetTable = null;
+    translationOffset = 0;
+    const cues = state.translation;
+    const segs = state.segments;
+    if (cues.length < 5 || segs.length < 5) return;
+
+    const starts = cues.map((c) => c.start).sort((a, b) => a - b);
+    const times = [];
+    const raw = [];
+    for (const seg of segs) {
+      const delta = nearestStart(starts, seg.start) - seg.start;
+      if (Math.abs(delta) > OFFSET_LIMIT) continue; // no counterpart to measure
+      times.push(seg.start);
+      raw.push(delta);
+    }
+    if (raw.length < 5) return;
+
+    const offsets = raw.map((_, i) =>
+      median(raw.slice(Math.max(0, i - OFFSET_WINDOW), i + OFFSET_WINDOW + 1))
+    );
+    offsetTable = { times, offsets };
+    translationOffset = median(raw.slice());
+  }
+
+  function median(values) {
+    values.sort((a, b) => a - b);
+    return values[Math.floor(values.length / 2)];
+  }
+
+  function nearestStart(sorted, t) {
+    const i = firstAtOrAfter(sorted, t);
+    const after = sorted[Math.min(i, sorted.length - 1)];
+    const before = i > 0 ? sorted[i - 1] : after;
+    return Math.abs(after - t) < Math.abs(t - before) ? after : before;
+  }
+
+  function firstAtOrAfter(sorted, t) {
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sorted[mid] < t) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  // The lag around a point in the video, for any time — the saved-clip paths ask
+  // about ranges that are not one of the source lines.
+  function offsetAt(t) {
+    if (!offsetTable) return 0;
+    const { times, offsets } = offsetTable;
+    const i = firstAtOrAfter(times, t);
+    if (i === 0) return offsets[0];
+    if (i >= times.length) return offsets[offsets.length - 1];
+    return times[i] - t < t - times[i - 1] ? offsets[i] : offsets[i - 1];
+  }
+
+  function refreshTranslationOffset() {
+    buildOffsetTable();
+    if (translationOffset)
+      console.log(
+        "[YLR] translation track runs",
+        Math.abs(translationOffset).toFixed(2) + "s",
+        translationOffset > 0 ? "late" : "early",
+        "— correcting for it"
+      );
+  }
+
+  const TRANSLATION_SLACK = 0.3; // seconds of authoring difference to forgive
+  const COVERS_LINE = 0.25; // this much of the line, or…
+  const SPENT_ON_LINE = 0.5; // …this much of the cue spent on it
+
   function translationFor(seg) {
     if (!state.translation.length) return "";
-    let parts = state.translation
-      .filter((c) => c.start >= seg.start - 0.4 && c.start < seg.end)
-      .map((c) => c.text);
-    if (!parts.length) {
-      let best = null;
-      for (const c of state.translation) {
-        if (c.start <= seg.start && c.end > seg.start) best = c;
-      }
-      if (best) parts = [best.text];
+    const from = seg.start - TRANSLATION_SLACK;
+    const to = seg.end + TRANSLATION_SLACK;
+    const span = Math.max(0.001, to - from);
+
+    const lag = offsetAt(seg.start);
+    const hits = [];
+    for (const cue of state.translation) {
+      // Shifted onto the source timeline before anything is compared.
+      const cueStart = cue.start - lag;
+      const cueEnd = cue.end - lag;
+      const overlap = Math.min(to, cueEnd) - Math.max(from, cueStart);
+      if (overlap <= 0) continue;
+      const cueSpan = Math.max(0.001, cueEnd - cueStart);
+      hits.push({ cue, overlap, ofLine: overlap / span, ofCue: overlap / cueSpan });
     }
-    return parts.join(" ").replace(/\s+/g, " ").trim();
+    if (!hits.length) return "";
+
+    let keep = hits.filter((h) => h.ofLine >= COVERS_LINE || h.ofCue >= SPENT_ON_LINE);
+    // Nothing cleared the bar, so fall back to the single best overlap rather
+    // than stitching together fragments of neighbours.
+    if (!keep.length) keep = [hits.reduce((a, b) => (b.overlap > a.overlap ? b : a))];
+
+    return keep
+      .sort((a, b) => a.cue.start - b.cue.start)
+      .map((h) => h.cue.text)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   async function selectTrack(track) {
@@ -134,6 +308,7 @@
       if (state.track !== track) return; // a newer selection superseded this one
       state.segments = segments || [];
       state.activeIndex = -1;
+      refreshTranslationOffset();
       startSync();
       renderSegments();
       loadSavedRanges();
@@ -226,6 +401,53 @@
               spoken is still shaded — only the word-by-word highlight goes away.
             </div>
           </div>
+          <div class="ylr-set-group">
+            <div class="ylr-set-label">Clip padding</div>
+            <div class="ylr-set-pads">
+              <label>before
+                <input id="ylr-set-lead" type="number" min="0" max="5" step="0.05">s
+              </label>
+              <label>after
+                <input id="ylr-set-tail" type="number" min="0" max="5" step="0.05">s
+              </label>
+            </div>
+            <div class="ylr-set-hint">
+              Subtitle timings mark when the text appears and disappears, which is
+              not quite when the speech starts and stops — so a clip is widened at
+              both ends. Applies to new clips; ones already saved keep the padding
+              they were cut with.
+            </div>
+          </div>
+          <div class="ylr-set-group">
+            <label class="ylr-set-check">
+              <input id="ylr-set-delexport" type="checkbox">
+              <span>Delete clips when exported</span>
+            </label>
+            <div class="ylr-set-hint">
+              Clears the library after an export, so the next one only contains what
+              is new. You are asked to confirm each time, after the file is written.
+            </div>
+          </div>
+          <div class="ylr-set-group">
+            <div class="ylr-set-label">Clips missing their details</div>
+            <button class="ylr-link ylr-set-scan">Find them</button>
+            <div class="ylr-set-repair"></div>
+            <div class="ylr-set-hint">
+              Older clips can be missing a title or a language. Opening the video
+              they came from repairs them automatically — this lists which ones,
+              newest first. Saved clips live under each site's own storage, so this
+              only sees the ones saved on this site.
+            </div>
+          </div>
+          <div class="ylr-set-group">
+            <div class="ylr-set-label">Diagnostics</div>
+            <div class="ylr-set-diag"></div>
+            <div class="ylr-set-hint">
+              The same facts the console reports. Content scripts log in their own
+              JavaScript context, which DevTools hides while "Selected context only"
+              is ticked — so they are repeated here, where nothing can filter them.
+            </div>
+          </div>
         </div>
       </div>
       <button class="ylr-jump" hidden>↑ Now playing</button>`;
@@ -274,6 +496,12 @@
       setWord: root.querySelector("#ylr-set-word"),
       setPush: root.querySelector("#ylr-set-push"),
       setHideCC: root.querySelector("#ylr-set-hidecc"),
+      setDiag: root.querySelector(".ylr-set-diag"),
+      setRepair: root.querySelector(".ylr-set-repair"),
+      setScan: root.querySelector(".ylr-set-scan"),
+      setDelExport: root.querySelector("#ylr-set-delexport"),
+      setLead: root.querySelector("#ylr-set-lead"),
+      setTail: root.querySelector("#ylr-set-tail"),
       jump: root.querySelector(".ylr-jump"),
       tabs: root.querySelectorAll(".ylr-tab"),
       menu,
@@ -327,7 +555,9 @@
 
     els.lang.addEventListener("change", () => {
       const t = state.tracks.find((x) => trackKey(x) === els.lang.value);
-      if (t) selectTrack(t);
+      if (!t) return;
+      manualTrack = true; // a deliberate switch, not the track this video opened on
+      selectTrack(t);
     });
     root.querySelector(".ylr-close").addEventListener("click", () => setOpen(false));
     toggle.addEventListener("click", () =>
@@ -357,6 +587,14 @@
         console.log("[YLR] could not save settings:", e.message);
       });
     });
+    els.setScan.addEventListener("click", listRepairable);
+    for (const input of [els.setLead, els.setTail])
+      input.addEventListener("change", savePadding);
+    els.setDelExport.addEventListener("change", () => {
+      NS.settings.set({ deleteOnExport: els.setDelExport.checked }).catch((e) => {
+        console.log("[YLR] could not save settings:", e.message);
+      });
+    });
     els.setPush.addEventListener("change", () => {
       pushPage = els.setPush.checked;
       applyLayout();
@@ -367,6 +605,123 @@
     document.addEventListener("fullscreenchange", applyLayout);
   }
 
+  // The video's own URL, without the clip's timestamp — the point is to open the
+  // title so the backfill runs, not to land on one line.
+  function videoUrl(raw) {
+    try {
+      const url = new URL(raw);
+      url.searchParams.delete("t");
+      return url.toString();
+    } catch (e) {
+      return raw;
+    }
+  }
+
+  async function listRepairable() {
+    els.setRepair.textContent = "Looking…";
+    let clips;
+    try {
+      clips = await NS.db.all();
+    } catch (e) {
+      els.setRepair.textContent = "Could not read the saved clips: " + e.message;
+      return;
+    }
+    const videos = new Map();
+    for (const c of clips) {
+      const needsTitle = !usableTitle(c.videoTitle);
+      const needsLang = !c.language;
+      if (!needsTitle && !needsLang) continue;
+      const key = c.videoId || c.url || "?";
+      const found = videos.get(key) || { url: c.url, clips: 0, title: "", missing: new Set() };
+      found.clips++;
+      if (needsTitle) found.missing.add("title");
+      if (needsLang) found.missing.add("language");
+      if (!found.title) found.title = usableTitle(c.videoTitle);
+      if (!found.url) found.url = c.url;
+      videos.set(key, found);
+    }
+
+    els.setRepair.innerHTML = "";
+    if (!videos.size) {
+      els.setRepair.textContent = "Nothing to repair — every clip saved here has both.";
+      return;
+    }
+    const head = document.createElement("div");
+    head.className = "ylr-set-repair-head";
+    head.textContent =
+      videos.size + (videos.size === 1 ? " video" : " videos") + " to open:";
+    els.setRepair.appendChild(head);
+    for (const v of videos.values()) {
+      const row = document.createElement("div");
+      row.className = "ylr-set-repair-row";
+      const link = document.createElement("a");
+      link.className = "ylr-link";
+      link.href = videoUrl(v.url);
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = v.title || videoUrl(v.url);
+      const note = document.createElement("span");
+      note.className = "ylr-set-repair-note";
+      note.textContent =
+        v.clips + (v.clips === 1 ? " clip" : " clips") + " · missing " +
+        Array.from(v.missing).join(" + ");
+      row.appendChild(link);
+      row.appendChild(note);
+      els.setRepair.appendChild(row);
+    }
+  }
+
+  function renderDiagnostics() {
+    if (!els || !els.setDiag) return;
+    bestKnownTitle(); // nudges the adapter to re-read its sources
+    const version =
+      (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "?";
+    const rows = [
+      "site: " + adapter.name + " · extension " + version,
+      "subtitles: " +
+        (state.segments.length
+          ? state.segments.length +
+            " lines" +
+            (state.track ? ", " + adapter.trackLabel(state.track) : "")
+          : "none loaded"),
+      "clip audio: " +
+        (NS.ClipExtractor && adapter.audioSegments ? "fetched directly" : "no fetch route") +
+        " · " +
+        (adapter.setupAudio ? "element tap available" : "no element tap")
+    ];
+    rows.push("title: " + (usableTitle(state.title) || "(none — nothing usable yet)"));
+    if (adapter.titleSources) {
+      const sources = adapter.titleSources();
+      for (const key of Object.keys(sources))
+        rows.push("  " + key + ": " + (sources[key] ? JSON.stringify(sources[key]) : "(empty)"));
+    }
+    const probe = adapter.directAudioStatus && adapter.directAudioStatus();
+    if (probe)
+      rows.push(
+        "audio probe: " +
+          (probe.probed ? probe.reason || (probe.ok ? "ok" : "failed") : "not run yet")
+      );
+    els.setDiag.textContent = rows.join("\n");
+  }
+
+  // Clamped on the way in as well as in setClipPad: a blank or nonsense field
+  // should fall back to the default rather than silently becoming zero.
+  function padValue(input, fallback) {
+    const n = parseFloat(input.value);
+    return Number.isFinite(n) ? Math.max(0, Math.min(5, n)) : fallback;
+  }
+
+  function savePadding() {
+    const clipLead = padValue(els.setLead, 0.8);
+    const clipTail = padValue(els.setTail, 0.65);
+    els.setLead.value = clipLead;
+    els.setTail.value = clipTail;
+    if (NS.setClipPad) NS.setClipPad(clipLead, clipTail);
+    NS.settings.set({ clipLead, clipTail }).catch((e) => {
+      console.log("[YLR] could not save settings:", e.message);
+    });
+  }
+
   function showSettings(s) {
     pushPage = s.pushPage !== false;
     hidePlayerCaptions = s.hidePlayerCaptions !== false;
@@ -374,8 +729,12 @@
       els.setWord.checked = !!s.wordHighlight;
       els.setPush.checked = pushPage;
       els.setHideCC.checked = hidePlayerCaptions;
+      els.setDelExport.checked = !!s.deleteOnExport;
+      els.setLead.value = s.clipLead;
+      els.setTail.value = s.clipTail;
     }
     applyWordHighlight(!!s.wordHighlight);
+    if (NS.setClipPad) NS.setClipPad(s.clipLead, s.clipTail);
     applyLayout();
   }
 
@@ -459,6 +818,7 @@
     els.saved.hidden = name !== "saved";
     els.settings.hidden = name !== "settings";
     if (name === "settings") {
+      renderDiagnostics();
       els.body.scrollTop = scrollPos.settings || 0;
     } else if (name === "saved") {
       els.body.scrollTop = scrollPos.saved || 0;
@@ -466,7 +826,10 @@
         .then(() => {
           if (activeTab === "saved") els.body.scrollTop = scrollPos.saved || 0;
         })
-        .catch(() => {});
+        .catch((e) => {
+          console.log("[YLR] the Saved tab failed to render:", e.message);
+          els.saved.innerHTML = '<div class="ylr-note">Could not list saved clips.</div>';
+        });
     } else if (autoFollow && activeRow()) {
       // They never scrolled away, so being caught up is their place, not
       // whatever offset the line happened to be at when they left.
@@ -531,20 +894,29 @@
 
   // Highlights survive reloads and track switches: rebuild the ranges from the
   // clips already in the database for this video.
+  //
+  // Every exit clears first. markSaved() adds a range the moment a clip is
+  // saved, so the marks on screen are only ever as true as the last rebuild —
+  // and a rebuild that gives up partway leaves marks for clips that are gone,
+  // with nothing to correct them until the page is reloaded. Showing no
+  // highlight is recoverable; showing a stale one is not.
   async function loadSavedRanges() {
-    const id = adapter.currentMediaId();
-    if (!id) return;
-    let clips;
-    try {
-      clips = await NS.db.all();
-    } catch (e) {
-      console.log("[YLR] could not read saved clips:", e.message);
-      return;
-    }
-    if (adapter.currentMediaId() !== id) return;
     state.savedRanges = [];
     state.starred = new Set();
-    for (const c of clips) {
+
+    const id = adapter.currentMediaId();
+    let clips = null;
+    if (id) {
+      try {
+        clips = await NS.db.all();
+      } catch (e) {
+        NS.warn("could not read saved clips", e);
+      }
+      // Navigated away mid-read: those clips belong to the previous video.
+      if (adapter.currentMediaId() !== id) clips = null;
+    }
+
+    for (const c of clips || []) {
       if (c.videoId !== id || typeof c.start !== "number") continue;
       state.savedRanges.push({ start: c.start, end: c.end });
       // ★ means the whole line was saved — a selection that merely begins at the
@@ -554,8 +926,80 @@
       );
       if (seg) state.starred.add(seg.start);
     }
+    if (clips) backfillClips();
     renderSegments();
   }
+
+  // Older clips can be missing a language (recorded only since it was added) or
+  // carry a title that was page chrome at the time — Netflix's real title often
+  // arrives a minute after the manifest, long after the clip was saved. Both are
+  // repaired the next time that video is opened.
+  //
+  // The title is safe to fix at any point; the language is not — see the
+  // manualTrack guard, which stops a deliberate language switch relabelling
+  // clips that were saved from a different track.
+  let lastBackfill = "";
+  // A missing timestamp is repairable from the clip alone — the start time is
+  // already stored — so unlike the title and the language it needs no page
+  // visit, and is fixed across the whole library rather than one video at a time.
+  function withTimestamp(url, start) {
+    if (!url || typeof start !== "number") return "";
+    try {
+      const u = new URL(url);
+      if (u.searchParams.get("t")) return ""; // already points somewhere
+      u.searchParams.set("t", String(Math.max(0, Math.floor(start))));
+      return u.toString();
+    } catch (e) {
+      return "";
+    }
+  }
+
+  async function backfillClips() {
+    if (!inPlayer) return;
+    const id = adapter.currentMediaId();
+    const title = bestKnownTitle();
+    const lang = !manualTrack && state.track ? state.track.languageCode || "" : "";
+    const key = id + "|" + title + "|" + lang;
+    if (key === lastBackfill) return;
+    lastBackfill = key;
+
+    let clips;
+    try {
+      clips = await NS.db.all();
+    } catch (e) {
+      return NS.warn("could not read clips to backfill", e);
+    }
+    const patched = [];
+    let links = 0;
+    for (const c of clips) {
+      const patch = {};
+      // Library-wide: nothing here depends on the page.
+      const link = withTimestamp(c.url, c.start);
+      if (link) {
+        patch.url = link;
+        links++;
+      }
+      // This video only: the title and language come from the page in front of us.
+      if (c.videoId === id) {
+        if (title && !usableTitle(c.videoTitle)) patch.videoTitle = title;
+        if (lang && !c.language) patch.language = lang;
+      }
+      if (Object.keys(patch).length) patched.push(Object.assign({}, c, patch));
+    }
+    if (!patched.length) return;
+    try {
+      await Promise.all(patched.map((c) => NS.db.add(c)));
+      console.log(
+        "[YLR] backfilled " + patched.length + " clip(s) —",
+        title ? JSON.stringify(title) : "(title unchanged)",
+        lang || "",
+        links ? "| " + links + " link(s) given a timestamp" : ""
+      );
+    } catch (e) {
+      NS.warn("could not backfill clips", e);
+    }
+  }
+
 
   function spaceBetween(prev, next) {
     return !!prev && !!next && !NS.isCJK(prev[prev.length - 1]) && !NS.isCJK(next[0]);
@@ -811,13 +1255,22 @@
 
   // Some sites only know the real episode name once their player has settled, so
   // ask for the freshest one at the moment the file is named.
+  // Page chrome, not the thing being watched. Recording one of these is worse
+  // than recording nothing, because it looks like an answer.
+  const JUNK_TITLE = /^(netflix|home|browse|my list|watch|prime video|youtube|)$/i;
+
+  function usableTitle(title) {
+    const t = String(title || "").trim();
+    return JUNK_TITLE.test(t) ? "" : t;
+  }
+
   function bestKnownTitle() {
     if (adapter.currentTitle) {
-      const fresh = (adapter.currentTitle() || "").trim();
-      const weak = !state.title || /^netflix$/i.test(state.title);
-      if (fresh && (weak || fresh.length > state.title.length)) state.title = fresh;
+      const fresh = usableTitle(adapter.currentTitle());
+      const held = usableTitle(state.title);
+      if (fresh && (!held || fresh.length > held.length)) state.title = fresh;
     }
-    return state.title;
+    return usableTitle(state.title);
   }
 
   function downloadTranscript(fmt, btn) {
@@ -1084,6 +1537,7 @@
       else break;
     }
     if (idx !== state.activeIndex) setActive(idx);
+    if (!deepLinkTried) applyDeepLink();
   }
 
   // ---- karaoke ----
@@ -1458,8 +1912,7 @@
   }
 
   function ensureExtractor() {
-    if (!NS.ClipExtractor) return null;
-    if (!adapter.audioSegments && !adapter.audioSource) return null;
+    if (!NS.ClipExtractor || !adapter.audioSegments) return null;
     if (!extractor) extractor = new NS.ClipExtractor(adapter);
     return extractor;
   }
@@ -1481,8 +1934,27 @@
         " | direct fetch: " + (canFetch ? "yes" : "no") +
         " | live tap: " + (canTap ? (audioReady ? "ready" : "available") : "no")
     );
-    if (!canFetch && !canTap)
-      throw new Error("this site's audio is protected and can't be captured");
+    if (!canFetch && !canTap) {
+      // Not a verdict about DRM — it means this adapter implements neither
+      // route. Say which, and hand over whatever the site's own probe found,
+      // because that is the thing that decides which route could be built.
+      const status = adapter.directAudioStatus ? adapter.directAudioStatus() : null;
+      console.log(
+        "[YLR] no audio route on " + adapter.name + ":" +
+          " audioSegments() " + (adapter.audioSegments ? "present" : "missing") +
+          ", setupAudio() " + (adapter.setupAudio ? "present" : "missing") +
+          ", ClipExtractor " + (NS.ClipExtractor ? "loaded" : "not loaded"),
+        status || "(no direct-audio probe on this site)"
+      );
+      throw new Error(
+        "this site has no audio route yet — " +
+          (status && status.reason
+            ? status.reason
+            : status && !status.probed
+              ? "the stream hasn't been probed yet, so try again once it's playing"
+              : "nothing to fetch from and no tap on the player")
+      );
+    }
 
     if (canTap && (!canFetch || audioReady)) {
       try {
@@ -1498,7 +1970,7 @@
       }
     }
 
-    return await extractor.extract(adapter.currentMediaId(), start, end);
+    return await extractor.extractFromSegments(start, end);
   }
 
   // The text, translation and timings are the point; the audio is a bonus. If
@@ -1522,6 +1994,7 @@
       clearTimeout(slow);
       if (!audioError) setCaptureStatus("");
     }
+    const thumb = await frameFor(range);
     const record = {
       id:
         adapter.currentMediaId() +
@@ -1530,15 +2003,21 @@
         "-" +
         range.end.toFixed(2),
       videoId: adapter.currentMediaId(),
-      videoTitle: state.title,
-      url: adapter.clipUrl(range),
+      videoTitle: bestKnownTitle(),
+      site: adapter.name,
+      language: state.track ? state.track.languageCode : "",
+      url: adapter.clipUrl({
+        start: range.start + syncOffset,
+        end: range.end + syncOffset
+      }),
       text: range.text,
       translation: translationFor(range),
       start: range.start,
       end: range.end,
       createdAt: Date.now(),
       audio: wav,
-      audioError
+      audioError,
+      thumb
     };
     await NS.db.add(record);
     // One line per save, so the outcome is findable without reading the whole log.
@@ -1550,7 +2029,9 @@
         "-" +
         range.end.toFixed(1) +
         "s | audio: " +
-        (audioError ? "FAILED — " + audioError : Math.round((wav.size || 0) / 1024) + " KB")
+        (audioError ? "FAILED — " + audioError : Math.round((wav.size || 0) / 1024) + " KB") +
+        " | image: " +
+        (thumb ? Math.round(thumb.size / 1024) + " KB" : "none")
     );
     markSaved(range);
     if (audioError) flashStatus("Saved text only — no audio: " + audioError, 0);
@@ -1565,6 +2046,19 @@
         timer = setTimeout(() => reject(new Error(message)), ms);
       })
     ]);
+  }
+
+  // A frame from the player, if one can be read and if it belongs to this line.
+  // The playhead is wherever the viewer is, so a line starred well ahead of it
+  // would get a picture of an unrelated scene — better none at all.
+  async function frameFor(range) {
+    if (!NS.captureFrame) return null;
+    const now = contentTime();
+    if (Number.isNaN(now) || now < range.start - 5 || now > range.end + 5) return null;
+    const shot = await NS.captureFrame(video());
+    if (shot.blob) return shot.blob;
+    NS.warn("no still frame for this clip", shot.reason);
+    return null;
   }
 
   let statusTimer = null;
@@ -1608,13 +2102,15 @@
       for (const clip of doomed) await NS.db.remove(clip.id);
       state.starred.delete(seg.start);
       console.log("[YLR] removed", doomed.length, "clip(s) at", seg.start.toFixed(1) + "s");
-      await loadSavedRanges(); // re-renders with the star and word marks cleared
       flashStatus(doomed.length ? "Removed from Saved." : "Nothing saved for that line.");
     } catch (e) {
       console.log("[YLR] unstar failed:", e.message);
       alert("Couldn't remove that clip: " + e.message);
     } finally {
       starEl.classList.remove("ylr-capturing");
+      // However it went — the marks have to describe the database, not the
+      // attempt. Half a delete leaves marks for clips that are already gone.
+      await loadSavedRanges();
     }
   }
 
@@ -1678,9 +2174,19 @@
       del.className = "ylr-link ylr-danger";
       del.textContent = "Delete";
       del.addEventListener("click", async () => {
-        await NS.db.remove(clip.id);
-        card.remove();
-        await loadSavedRanges(); // re-renders with the highlight gone
+        del.disabled = true;
+        try {
+          await NS.db.remove(clip.id);
+        } catch (e) {
+          del.disabled = false;
+          NS.warn("could not delete a clip", e, clip.id);
+          alert("Couldn't delete that clip: " + e.message);
+          return;
+        }
+        // Re-read rather than just dropping the card: the list has to show what
+        // the database holds, or "gone from Saved" stops meaning anything.
+        await loadSavedRanges(); // clears the star and word marks
+        await renderSaved();
         tick();
       });
 
@@ -1726,30 +2232,27 @@
     count.textContent =
       clips.length + (clips.length === 1 ? " clip" : " clips") + " · " + mb(bytes);
 
+    const LABEL = "⬇ Export CSV + audio";
     const btn = document.createElement("button");
     btn.className = "ylr-link";
-    btn.textContent = "⬇ Export library";
+    btn.textContent = LABEL;
     btn.addEventListener("click", async () => {
       btn.disabled = true;
       try {
-        const html = await NS.buildLibraryHtml(clips, (done, total) => {
-          btn.textContent = "Embedding audio " + done + "/" + total + "…";
+        const result = await NS.exportLibrary(clips, (done, total) => {
+          btn.textContent = "Packing " + done + "/" + total + "…";
         });
-        btn.textContent = "Building file…";
-        const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "passage-library-" + new Date().toISOString().slice(0, 10) + ".html";
-        document.body.appendChild(a); // detached anchors don't always download
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 30000);
-        btn.textContent = "⬇ Export library";
+        flashStatus(
+          "Exported " + result.rows + " clips to " + result.name + " — " +
+            result.audio + " audio, " + result.images + " images, " + mb(result.size) + ".",
+          8000
+        );
+        if (NS.settings.get().deleteOnExport) await offerToClear(clips, result);
       } catch (e) {
         console.log("[YLR] export failed:", e.message);
         alert("Couldn't export the library: " + e.message);
-        btn.textContent = "⬇ Export library";
       } finally {
+        btn.textContent = LABEL;
         btn.disabled = false;
       }
     });
@@ -1757,6 +2260,32 @@
     bar.appendChild(count);
     bar.appendChild(btn);
     return bar;
+  }
+
+  // Asked after the file is written, never before: a confirm that fires first
+  // would be answered before there is anything to check.
+  async function offerToClear(clips, result) {
+    const ok = confirm(
+      "Exported " +
+        clips.length +
+        " clips to " +
+        result.name +
+        ".\n\nDelete them from the library now?\n\n" +
+        "Check the download actually finished first — this cannot be undone."
+    );
+    if (!ok) return;
+    let removed = 0;
+    for (const clip of clips) {
+      try {
+        await NS.db.remove(clip.id);
+        removed++;
+      } catch (e) {
+        NS.warn("could not delete a clip after export", e, clip.id);
+      }
+    }
+    await loadSavedRanges(); // clears the saved-word highlights
+    await renderSaved();
+    flashStatus("Removed " + removed + " exported clips.", 6000);
   }
 
   function mb(bytes) {
@@ -1779,6 +2308,12 @@
   // Everything tied to one title. Leaving the player throws it all away so that
   // coming back re-fetches rather than showing the last video's lines.
   function resetMedia() {
+    manualTrack = false; // the next track choice is ours again
+    translationOffset = 0;
+    offsetTable = null;
+    lastBackfill = "";
+    state.title = "";
+    deepLinkTried = false;
     state.mediaId = null;
     state.track = null;
     state.tracks = [];

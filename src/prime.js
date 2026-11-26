@@ -93,6 +93,10 @@
 
   function onMessage(ev) {
     if (ev.source !== window || !ev.data || ev.data.source !== "YLR") return;
+    if (ev.data.type === "PV_MPD") {
+      reportManifest(ev.data.body, ev.data.url);
+      return;
+    }
     if (ev.data.type !== "PV_TRACKS") return;
     tracks = ev.data.tracks || [];
     mediaId = ev.data.mediaId;
@@ -109,26 +113,115 @@
   // whether Prime does the same. If the audio adaptation set has no
   // ContentProtection, clips can be range-fetched and decoded instead of
   // replayed through the speakers.
-  let probed = false;
+  let probe = { probed: false, hasAudio: false, ok: false, reason: "" };
+
+  // The injector caught the DASH manifest itself, which is the direct answer to
+  // "can Prime audio be fetched and decoded like Netflix's?".
+  // Several manifests arrive per title. A verdict is only final once one of
+  // them actually contains audio — a video-only manifest must not end the
+  // search, which is what a single `probed` latch used to do.
+  const seenManifests = [];
+  function reportManifest(body, url) {
+    if (probe.probed && probe.hasAudio) return;
+    if (seenManifests.indexOf(url) !== -1) return;
+    seenManifests.push(url);
+    probe.probed = true;
+    console.log(
+      "[YLR] PV_MPD " + seenManifests.length + " received:",
+      (body || "").length,
+      "bytes",
+      String(url).slice(0, 90)
+    );
+    let verdict;
+    try {
+      verdict = describeManifest(body, url);
+    } catch (e) {
+      probe.reason = "reading the manifest threw — " + e.message;
+      console.log("[YLR] audio probe:", probe.reason);
+      return;
+    }
+    if (!verdict) {
+      const sets = describeSets(body);
+      // Not final: another manifest may still carry the audio.
+      if (!probe.hasAudio)
+        probe = {
+          probed: true,
+          hasAudio: false,
+          ok: false,
+          reason:
+            "no audio adaptation set in " +
+            seenManifests.length +
+            " manifest(s) so far — " +
+            sets
+        };
+      console.log("[YLR] audio probe: no audio adaptation set —", sets);
+      return;
+    }
+    probe.hasAudio = true;
+    // Recorded, not just logged: the Settings tab shows this, because the
+    // console is one filter setting away from hiding the isolated world.
+    probe = {
+      probed: true,
+      hasAudio: true,
+      ok: verdict.summary.indexOf("NOT possible") === -1,
+      reason: verdict.summary
+    };
+    console.log("[YLR] audio probe:", verdict.summary);
+    console.log("[YLR] audio probe detail:", verdict);
+  }
+
+  // When no audio set is found, say what the manifest did contain: separate
+  // audio and video manifests would explain it.
+  function describeSets(body) {
+    try {
+      const doc = new DOMParser().parseFromString(body, "text/xml");
+      if (doc.getElementsByTagName("parsererror").length) return "not parseable as XML";
+      const sets = Array.prototype.slice.call(
+        doc.getElementsByTagNameNS("*", "AdaptationSet")
+      );
+      if (!sets.length) return "no AdaptationSet elements at all";
+      return (
+        sets.length +
+        " set(s): " +
+        sets
+          .map(
+            (a) =>
+              (a.getAttribute("contentType") || a.getAttribute("mimeType") || "?") +
+              "/" +
+              (a.getAttribute("lang") || "-")
+          )
+          .join(", ")
+      );
+    } catch (e) {
+      return "unreadable (" + e.message + ")";
+    }
+  }
 
   async function probeAudio(manifests) {
-    if (probed || !manifests.length) return;
-    probed = true;
+    if (probe.probed || !manifests.length) return;
+    probe.probed = true;
     console.log("[YLR] probing", manifests.length, "media manifest(s) for fetchable audio");
+    const tried = [];
     for (const url of manifests) {
       try {
         const body = await fetchText(url);
         const verdict = describeManifest(body, url);
         if (verdict) {
+          probe.ok = verdict.summary.indexOf("NOT possible") === -1;
+          probe.reason = verdict.summary;
           console.log("[YLR] audio probe:", verdict.summary);
           console.log("[YLR] audio probe detail:", verdict);
           return;
         }
+        tried.push("no audio set in " + url.slice(0, 60));
       } catch (e) {
+        tried.push(e.message);
         console.log("[YLR] audio probe: could not read", url.slice(0, 80), "-", e.message);
       }
     }
-    console.log("[YLR] audio probe: no readable DASH manifest among", manifests.length, "url(s)");
+    probe.reason =
+      "no readable DASH manifest among " + manifests.length + " url(s) — " + tried.join("; ");
+    console.log("[YLR] audio probe:", probe.reason);
   }
 
   function describeManifest(body, url) {
@@ -274,6 +367,9 @@
     isWatchPage() {
       return !!getVideo();
     },
+    directAudioStatus() {
+      return probe;
+    },
     currentMediaId,
     getVideo,
     seek(seconds) {
@@ -281,9 +377,11 @@
       if (v) {
         try {
           v.currentTime = seconds;
-          v.play().catch(() => {});
+          v.play().catch((err) => NS.warn("prime: play() after seek refused", err));
           return;
-        } catch (e) {}
+        } catch (e) {
+          NS.warn("prime: currentTime seek rejected, using the player API", e);
+        }
       }
       window.postMessage({ source: "YLR-CS", type: "PV_SEEK", seconds }, "*");
     },
@@ -304,8 +402,9 @@
     translationLabel() {
       return translationTrack ? translationTrack.name : "";
     },
-    clipUrl() {
-      return location.origin + location.pathname;
+    clipUrl(range) {
+      const at = range && range.start != null ? Math.max(0, Math.floor(range.start)) : 0;
+      return location.origin + location.pathname + "?t=" + at;
     },
     onNavigate(cb) {
       watchNavigation(cb);
@@ -326,4 +425,5 @@
 
 
   };
+  console.log("[YLR] prime adapter ready");
 })();

@@ -11,24 +11,6 @@
   class ClipExtractor {
     constructor(adapter) {
       this.adapter = adapter;
-      this.el = null;
-      this.cap = null;
-      this.mediaId = null;
-      this.blobUrl = null;
-      this._preparing = null;
-    }
-
-    _teardown() {
-      if (this.el) {
-        this.el.pause();
-        this.el.removeAttribute("src");
-      }
-      if (this.cap && this.cap.ctx) this.cap.ctx.close().catch(() => {});
-      if (this.blobUrl) URL.revokeObjectURL(this.blobUrl);
-      this.el = null;
-      this.cap = null;
-      this.blobUrl = null;
-      this.mediaId = null;
     }
 
     _load(el) {
@@ -57,36 +39,6 @@
       });
     }
 
-    async _prepare(mediaId) {
-      const src = await this.adapter.audioSource();
-      console.log("[YLR] clip extractor: audio source from", src.from, src.mime);
-      const el = new Audio();
-      el.preload = "auto";
-      el.crossOrigin = "anonymous"; // without CORS the graph would be silenced
-      el.src = src.url;
-      try {
-        await this._load(el);
-      } catch (e) {
-        // Cross-origin refusal or an expired URL: have the page fetch the bytes
-        // for us (it has the right origin) and play them from a local blob.
-        console.log("[YLR] clip extractor: direct URL failed (" + e.message + "); fetching bytes");
-        const res = await this.adapter.audioBytes();
-        this.blobUrl = URL.createObjectURL(
-          new Blob([res.buffer], { type: String(res.mime || "").split(";")[0] })
-        );
-        el.removeAttribute("crossorigin");
-        el.src = this.blobUrl;
-        await this._load(el);
-      }
-      this.el = el;
-      this.cap = new NS.AudioCapture(el, { bufferSeconds: 45 });
-      await this.cap.ensureFromElement({ silent: true });
-      this.mediaId = mediaId;
-      console.log("[YLR] clip extractor ready; duration", el.duration);
-    }
-
-    // Primary path: the player's own audio segments, decoded and cut. Instant,
-    // and it doesn't care where the playhead is.
     async extractFromSegments(start, end) {
       const pad = NS.CLIP_PAD;
       const from0 = Math.max(0, start - pad.lead);
@@ -185,7 +137,7 @@
       } finally {
         el.pause();
         el.removeAttribute("src");
-        if (cap && cap.ctx) cap.ctx.close().catch(() => {});
+        if (cap && cap.ctx) cap.ctx.close().catch(() => {}); // teardown, nothing to report to
         URL.revokeObjectURL(url);
       }
     }
@@ -220,57 +172,6 @@
       });
     }
 
-    async extract(mediaId, start, end) {
-      let segErr = null;
-      if (this.adapter.audioSegments) {
-        try {
-          return await this.extractFromSegments(start, end);
-        } catch (e) {
-          segErr = e;
-          console.log("[YLR] segment extraction failed:", e.message);
-        }
-      }
-      if (!this.adapter.audioSource) throw segErr || new Error("no audio source");
-      try {
-        return await this.extractByReplay(mediaId, start, end);
-      } catch (e) {
-        console.log("[YLR] replay extraction failed:", e.message);
-        throw segErr || e; // the segment reason is the actionable one
-      }
-    }
-
-    async extractByReplay(mediaId, start, end) {
-      if (this.mediaId && this.mediaId !== mediaId) this._teardown();
-      if (!this._preparing || this.mediaId !== mediaId) {
-        this._preparing = this._prepare(mediaId).catch((e) => {
-          this._preparing = null;
-          throw e;
-        });
-      }
-      await this._preparing;
-      this.cap.reset();
-      this.cap.resume();
-      this.el.currentTime = Math.max(0, start - NS.CLIP_PAD.lead - 0.4);
-      try {
-        await this.el.play();
-      } catch (e) {
-        throw new Error("couldn't play the audio stream to record it: " + e.message);
-      }
-      console.log(
-        "[YLR] clip extractor: recording",
-        start.toFixed(2) + "→" + end.toFixed(2)
-      );
-      try {
-        return await this.cap.capture(start, end, {
-          waitForPlayback: true,
-          label: "the audio-stream replay"
-        });
-      } finally {
-        this.el.pause();
-        if (this.cap.ctx && this.cap.ctx.state === "running")
-          this.cap.ctx.suspend().catch(() => {});
-      }
-    }
   }
 
   NS.ClipExtractor = ClipExtractor;

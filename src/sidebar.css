@@ -557,3 +557,75 @@ html.ylr-hidecc.ylr-open [class*="captions-overlay"] {
   font-size: 12px;
   line-height: 1.4;
 }
+
+.ylr-set-diag {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: #17181a;
+  border: 1px solid #2a2b2e;
+  color: #b9c0c8;
+  font-family: Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+.ylr-set-pads {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  font-size: 13px;
+  color: #ccc;
+}
+.ylr-set-pads label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.ylr-set-pads input {
+  width: 62px;
+  background: #1c1c1c;
+  color: #f1f1f1;
+  border: 1px solid #3f3f3f;
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-family: inherit;
+  font-size: 13px;
+}
+.ylr-set-pads input:focus {
+  outline: none;
+  border-color: #3ea6ff;
+}
+
+.ylr-set-repair {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #b9c0c8;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.ylr-set-repair-head {
+  color: #888;
+  margin-bottom: 6px;
+}
+.ylr-set-repair-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 0;
+  border-top: 1px solid #1c1c1c;
+}
+.ylr-set-repair-row .ylr-link {
+  font-size: 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.ylr-set-repair-note {
+  color: #777;
+  font-size: 11px;
+}

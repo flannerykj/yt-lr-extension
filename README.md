@@ -201,7 +201,12 @@ supplies tracks, captions, seeking, and the audio source.
   player's own audio segments instead (`clip-extractor.js`). Buffer slices are
   taken in *player* time, so the ad-drift offset is applied there too.
 - **Storage**: clips (text, WAV, timings, source URL) go into IndexedDB; the
-  **Saved** tab lists them with a player, download, and delete. Audio is optional:
+  **Saved** tab lists them with a player, download, and delete. **Export** writes
+  a single `.zip` holding `clips.csv`, every WAV and every still frame, flat, so
+  the CSV's `audio_file` and `image_file` columns resolve the moment it is
+  unpacked (the audio and the still for one line share a filename stem). With **Delete clips when
+  exported** on (Settings), it then offers to clear the library — asked *after* the
+  file is written, so there is something to check before answering. Audio is optional:
   if every capture route fails the line is still saved with its text, translation
   and timings, and the record keeps the reason in `audioError` so the Saved tab
   and the exported library can show "text only" instead of a broken player.

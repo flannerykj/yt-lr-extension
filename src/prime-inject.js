@@ -4,7 +4,20 @@
 // deep-scan anything that looks like that document, and post the tracks to the
 // content script. Also handles seeking.
 (function () {
-  console.log("[YLR] prime-inject loaded — build 16");
+  console.log("[YLR] prime-inject loaded 0.4.1");
+
+  // The isolated world's NS.warn isn't reachable from here, so a local copy.
+  // These hooks sit on the page's own fetch/XHR/JSON.parse and must never throw
+  // into the page — but a hook that fails invisibly is indistinguishable from
+  // one that was never installed.
+  const warned = new Set();
+  function warn(where, err) {
+    const message = (err && err.message) || String(err == null ? "" : err);
+    if (warned.has(where + message)) return;
+    warned.add(where + message);
+    console.log("[YLR] " + where + (message ? " — " + message : ""));
+  }
+
   const origParse = JSON.parse;
   const originalFetch = window.fetch;
   let cached = null; // { tracks, mediaId, title }
@@ -141,7 +154,11 @@
   // one carrying the media. These are therefore collected from every response,
   // independently of the subtitle handling, and matched on the *key* they sit
   // under rather than on a file extension the URLs may not have.
-  const MEDIA_KEYS = /audioVideoUrls|avCdnUrlSets|cdnUrlSets|urlSets|playbackUrls|manifestUrls|streamingUrls/i;
+  // Deliberately narrow. A looser match (playbackUrls, urlSets, streamingUrls)
+  // also hits Prime's ad payloads, which then poison the cache and the real
+  // manifest is never looked at.
+  const MEDIA_KEYS = /audioVideoUrls|avCdnUrlSets|avUrlInfoList/i;
+  const NOT_MEDIA = /getAds|\/ads\b|amazon\.dev|doubleclick|\.metrics\./i;
   let mediaUrls = [];
   let shapeLogged = false;
 
@@ -154,7 +171,7 @@
         const v = n[k];
         const inMedia = underMedia || MEDIA_KEYS.test(k);
         if (typeof v === "string") {
-          if (inMedia && /^https?:/.test(v) && !seen.has(v)) {
+          if (inMedia && /^https?:/.test(v) && !NOT_MEDIA.test(v) && !seen.has(v)) {
             seen.add(v);
             urls.push(v);
           }
@@ -248,19 +265,92 @@
         scanDeep(data, 0);
         noteMedia(data);
       }
-    } catch (e) {}
+    } catch (e) {
+      warn("prime: JSON.parse hook failed", e);
+    }
     return data;
   };
 
   const RESOURCE_URL = /GetPlaybackResources|playbackresources|\/cdp\/catalog\/|atv-ps|GetVodPlaybackResources/i;
+
+  // The media manifest is a DASH .mpd — XML, not JSON — so no amount of digging
+  // through parsed objects will find it. Recognise it by its body as it goes
+  // past, and hand it straight over: the URLs are short-lived and signed, so the
+  // bytes are worth more than the address.
+  // Cached, not just posted: this runs at document_start and the player fetches
+  // its manifest early, so the message can easily land before the isolated-world
+  // adapter (document_idle) has a listener. It is re-sent on request.
+  // Prime splits a title across several manifests — video in one, audio in
+  // another. Keeping only the first meant a video-only manifest ended the
+  // search for good and the audio one was never looked at, so keep them all.
+  const MAX_MPDS = 8;
+  const mpds = [];
+  function noteMpd(url, text) {
+    if (typeof text !== "string") return;
+    if (text.length < 200 || text.indexOf("<MPD") === -1) return;
+    const href = String(url);
+    if (mpds.length >= MAX_MPDS || mpds.some((m) => m.url === href)) return;
+    const entry = { url: href, body: text.slice(0, 2000000) };
+    mpds.push(entry);
+    console.log(
+      "[YLR] Prime DASH manifest " + mpds.length + " seen (" + text.length + " bytes)",
+      href.slice(0, 100),
+      "| audio sets: " + countAudioSets(text)
+    );
+    postOne(entry);
+  }
+
+  // Read in the main world too, so the count shows up even when the console is
+  // filtered to this context.
+  function countAudioSets(text) {
+    const sets = text.match(/<AdaptationSet\b[^>]*/g) || [];
+    const audio = sets.filter((a) => /audio/i.test(a));
+    if (!audio.length) return "0 of " + sets.length + " set(s)";
+    return (
+      audio.length +
+      " of " +
+      sets.length +
+      " set(s), lang=" +
+      audio.map((a) => (a.match(/lang="([^"]*)"/) || [, "?"])[1]).join(",")
+    );
+  }
+
+  function postOne(entry) {
+    window.postMessage(Object.assign({ source: "YLR", type: "PV_MPD" }, entry), "*");
+  }
+
+  function postMpd() {
+    for (const entry of mpds) postOne(entry);
+  }
+
+  function looksXml(res) {
+    try {
+      const type = res.headers.get("content-type") || "";
+      return /xml|dash/i.test(type);
+    } catch (e) {
+      return false;
+    }
+  }
 
   window.fetch = async function (...args) {
     const res = await originalFetch.apply(this, args);
     try {
       const url = typeof args[0] === "string" ? args[0] : args[0] && args[0].url;
       if (url && RESOURCE_URL.test(String(url)))
-        res.clone().text().then(scanText).catch(() => {});
-    } catch (e) {}
+        res
+          .clone()
+          .text()
+          .then(scanText)
+          .catch((e) => warn("prime: could not read a resources response", e));
+      if (url && (/\.mpd|manifest|dash/i.test(String(url)) || looksXml(res)))
+        res
+          .clone()
+          .text()
+          .then((t) => noteMpd(url, t))
+          .catch((e) => warn("prime: could not read a manifest response", e));
+    } catch (e) {
+      warn("prime: fetch hook failed", e);
+    }
     return res;
   };
 
@@ -275,7 +365,10 @@
       try {
         if (this.__ylrUrl && RESOURCE_URL.test(String(this.__ylrUrl)))
           scanText(this.responseText);
-      } catch (e) {}
+        if (this.__ylrUrl) noteMpd(this.__ylrUrl, this.responseText);
+      } catch (e) {
+        warn("prime: XHR hook failed", e);
+      }
     });
     return xhrSend.apply(this, arguments);
   };
@@ -291,7 +384,9 @@
         players[0].seekTo(seconds * 1000);
         return;
       }
-    } catch (e) {}
+    } catch (e) {
+      warn("prime: player SDK seek unavailable", e);
+    }
     const v = document.querySelector("video");
     if (v) {
       try {
@@ -304,7 +399,10 @@
 
   window.addEventListener("message", (ev) => {
     if (ev.source !== window || !ev.data || ev.data.source !== "YLR-CS") return;
-    if (ev.data.type === "PV_REQUEST_TRACKS") post();
+    if (ev.data.type === "PV_REQUEST_TRACKS") {
+      post();
+      postMpd();
+    }
     else if (ev.data.type === "PV_SEEK") seek(ev.data.seconds);
   });
 })();

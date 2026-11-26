@@ -1,10 +1,9 @@
-// Two ways to see your saved clips, both fed from this content script because
-// IndexedDB lives under the site's origin:
-//   - "Export library" writes one self-contained HTML file (audio inlined as
-//     data URIs) that opens off the disk with no extension and no server.
-//   - The extension's library page pulls clips over messaging, a few at a time.
-// Both render with src/library-view.js — inlined into the export, loaded as a
-// script by the page.
+// Getting saved clips out, from a content script because IndexedDB lives under
+// the site's origin:
+//   - "Export" writes a CSV plus the WAV files, all into the download folder,
+//     with an audio_file column tying the two together.
+//   - The extension's library page pulls clips over messaging, a few at a time,
+//     and renders them with src/library-view.js.
 (function () {
   const NS = (window.YLR = window.YLR || {});
 
@@ -26,75 +25,145 @@
       start: clip.start,
       end: clip.end,
       createdAt: clip.createdAt,
-      audio: clip.audio ? await blobToDataUri(clip.audio) : null
+      audio: clip.audio ? await blobToDataUri(clip.audio) : null,
+      thumb: clip.thumb ? await blobToDataUri(clip.thumb) : null
     };
   }
 
-  // Safe inside <script type="application/json">: base64 has no "<", but clip
-  // text is arbitrary and could otherwise close the tag. Read back with
-  // JSON.parse, so U+2028/9 need no escaping.
-  function embedJson(value) {
-    return JSON.stringify(value)
-      .replace(/</g, "\\u003c")
-      .replace(/>/g, "\\u003e")
-      .replace(/&/g, "\\u0026");
+  // ---- CSV + audio export ----
+  //
+  // One row per clip, plus the WAV files beside it. The audio_file column names
+  // the file that lands next to the CSV, so a spreadsheet, an Anki import or a
+  // script can line the two up.
+
+  const COLUMNS = [
+    "source_text",
+    "translation",
+    "audio_file",
+    "source_image",
+    "source_name",
+    "date_added",
+    "language",
+    "url",
+    "start",
+    "end"
+  ];
+
+  // RFC 4180: quote anything containing a delimiter, a quote or a newline, and
+  // double the quotes inside.
+  function csvCell(value) {
+    const text = value == null ? "" : String(value);
+    return /[",\n\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
   }
 
-  const BOOTSTRAP = `
-var style = document.createElement("style");
-style.textContent = window.YLRView.CSS;
-document.head.appendChild(style);
-window.YLRView.mount({
-  list: document.getElementById("list"),
-  search: document.getElementById("q"),
-  sort: document.getElementById("sort")
-}).set(JSON.parse(document.getElementById("data").textContent));
-`;
+  function csvRow(cells) {
+    return cells.map(csvCell).join(",");
+  }
 
-  async function viewSource() {
-    const res = await fetch(chrome.runtime.getURL("src/library-view.js"));
-    if (!res.ok) throw new Error("could not load the viewer (HTTP " + res.status + ")");
-    return res.text();
+  function timecode(seconds) {
+    const total = Math.max(0, Math.round(seconds || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    return (
+      String(h).padStart(2, "0") + "-" + String(m).padStart(2, "0") + "-" + String(s).padStart(2, "0")
+    );
+  }
+
+  // Windows and macOS between them disallow / \ : * ? " < > | and control
+  // characters; trailing dots and spaces also cause trouble on Windows.
+  function safeFile(text, max) {
+    return (
+      String(text || "")
+        .replace(/[\\/:*?"<>|]/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, max)
+        .replace(/[. ]+$/, "") || "clip"
+    );
+  }
+
+  // The audio and the still share a stem, so a row's two files sort together and
+  // are obviously a pair.
+  function clipStem(clip, used) {
+    const base = safeFile(clip.text, 48) + " [" + timecode(clip.start) + "]";
+    let stem = base;
+    for (let n = 2; used.has(stem); n++) stem = base + " (" + n + ")";
+    used.add(stem);
+    return stem;
+  }
+
+  function buildCsv(clips, files) {
+    const rows = [csvRow(COLUMNS)];
+    clips.forEach((clip, i) => {
+      rows.push(
+        csvRow([
+          clip.text || "",
+          clip.translation || "",
+          files[i].audio || "",
+          files[i].image || "",
+          clip.videoTitle || "",
+          clip.createdAt ? new Date(clip.createdAt).toISOString() : "",
+          clip.language || "",
+          clip.url || "",
+          (clip.start || 0).toFixed(2),
+          (clip.end || 0).toFixed(2)
+        ])
+      );
+    });
+    // A byte order mark, so Excel reads it as UTF-8 rather than mangling accents.
+    return "\ufeff" + rows.join("\r\n") + "\r\n";
+  }
+
+  function downloadBlob(name, blob) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a); // detached anchors don't always download
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
   // clips arrive newest-first (db.all sorts by createdAt desc)
-  async function buildLibraryHtml(clips, onProgress) {
-    const view = await viewSource();
-    const out = [];
-    for (let i = 0; i < clips.length; i++) {
-      out.push(await toPlain(clips[i]));
-      if (onProgress) onProgress(i + 1, clips.length);
-    }
-    const seconds = out.reduce((n, c) => n + Math.max(0, c.end - c.start || 0), 0);
-    const close = "</" + "script>";
-    return (
-      '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">\n' +
-      '<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
-      "<title>Saved clips</title>\n</head>\n<body>\n" +
-      '<header>\n<h1>Saved clips</h1>\n<div class="sub">' +
-      out.length +
-      (out.length === 1 ? " clip" : " clips") +
-      " · " +
-      Math.round(seconds) +
-      "s of audio · exported " +
-      new Date().toLocaleString() +
-      '</div>\n<div class="controls">\n' +
-      '<input type="search" id="q" placeholder="Search text, translation or video">\n' +
-      '<select id="sort"><option value="newest">Newest first</option>' +
-      '<option value="oldest">Oldest first</option>' +
-      '<option value="video">Group by video</option></select>\n' +
-      '</div>\n</header>\n<main id="list"></main>\n' +
-      '<script id="data" type="application/json">' +
-      embedJson(out) +
-      close +
-      "\n<script>" +
-      view +
-      close +
-      "\n<script>" +
-      BOOTSTRAP +
-      close +
-      "\n</body></html>\n"
-    );
+  //
+  // Everything goes into one .zip, flat: the CSV at the root with the WAVs
+  // beside it, so the audio_file column resolves the moment it is unpacked. One
+  // download rather than N+1 also avoids the browser throttling a burst and
+  // Chrome asking whether the site may save multiple files.
+  async function exportLibrary(clips, onProgress) {
+    const used = new Set();
+    const named = clips.map((clip) => {
+      const stem = clipStem(clip, used);
+      return {
+        audio: clip.audio ? stem + ".wav" : "",
+        image: clip.thumb ? stem + ".jpg" : ""
+      };
+    });
+    const stamp = new Date().toISOString().slice(0, 10);
+    const zipName = "passage-clips-" + stamp + ".zip";
+
+    const files = [
+      { name: "clips.csv", data: buildCsv(clips, named), date: Date.now() }
+    ];
+    clips.forEach((clip, i) => {
+      if (clip.audio) files.push({ name: named[i].audio, data: clip.audio, date: clip.createdAt });
+      if (clip.thumb) files.push({ name: named[i].image, data: clip.thumb, date: clip.createdAt });
+    });
+
+    const blob = await NS.zip(files, (done, total) => {
+      if (onProgress) onProgress(done, total);
+    });
+    downloadBlob(zipName, blob);
+    return {
+      rows: clips.length,
+      files: files.length - 1,
+      audio: named.filter((n) => n.audio).length,
+      images: named.filter((n) => n.image).length,
+      name: zipName,
+      size: blob.size
+    };
   }
 
   // ---- serving the extension's library page ----
@@ -122,5 +191,5 @@ window.YLRView.mount({
     });
   }
 
-  NS.buildLibraryHtml = buildLibraryHtml;
+  NS.exportLibrary = exportLibrary;
 })();

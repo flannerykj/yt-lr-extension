@@ -85,13 +85,16 @@ itself in an IIFE and publishes only what it means to:
 
 | File | Publishes |
 |---|---|
+| `log.js` | `NS.warn(where, err)` — deduped one-line reports |
 | `db.js` | `NS.db` — IndexedDB for saved clips |
 | `settings.js` | `NS.settings` — `chrome.storage.local` preferences |
 | `captions.js` | `NS.isCJK`, `NS.parseJson3`, `NS.parseJson3Cues`, `NS.parseWebVTT`, `NS.parseTTML` |
 | `audio.js` | `NS.AudioCapture`, `NS.encodeWav`, `NS.CLIP_PAD` |
 | `mp4.js` | `NS.mp4` — fragmented-MP4 index and ADTS remux |
 | `clip-extractor.js` | `NS.ClipExtractor` |
-| `library.js` | `NS.buildLibraryHtml` |
+| `library.js` | `NS.exportLibrary` — one zip of `clips.csv` + WAVs |
+| `zip.js` | `NS.zip` — stored-method ZIP writer, no dependencies |
+| `thumb.js` | `NS.captureFrame` — a still from the `<video>`, or the reason there isn't one |
 | `youtube.js` / `netflix.js` / `prime.js` | **`NS.adapter`** |
 | `core.js` | nothing — it only consumes |
 
@@ -107,9 +110,9 @@ Classic scripts run in manifest order, so the list is a hand-sorted dependency
 graph. `core.js` is always last; the adapter always immediately before it.
 
 ```
-netflix:   db, settings, captions, audio, library, mp4, clip-extractor, netflix.js, core.js
-youtube:   db, settings, captions, audio, library, clip-extractor, youtube.js, core.js
-prime:     db, settings, captions, audio, library, prime.js, core.js
+netflix:   log, zip, thumb, db, settings, captions, audio, library, mp4, clip-extractor, netflix.js, core.js
+youtube:   log, zip, thumb, db, settings, captions, audio, library, clip-extractor, youtube.js, core.js
+prime:     log, zip, thumb, db, settings, captions, audio, library, prime.js, core.js
 ```
 
 Prime omits `mp4.js` and `clip-extractor.js` — it cannot fetch its audio, so that
@@ -126,6 +129,36 @@ function ensureExtractor() {
 
 `core.js` opens with `const adapter = NS.adapter; if (!adapter) return;` — if the
 adapter failed to load, the sidebar does nothing rather than half-initialising.
+It logs *before* that guard, though, and unconditionally:
+
+```
+[YLR] prime adapter ready
+[YLR] core 0.4.0 loading | adapter: prime
+```
+
+Without those two lines, a silent early return here is indistinguishable from the
+isolated world never being injected at all — which cost a debugging round.
+
+## Failing quietly, but not invisibly
+
+Swallowing an error is often correct. A hook installed on the page's own `fetch`
+must never throw into the page; a teardown has nowhere to report to; the first two
+attempts of a three-way fallback are *expected* to fail. Swallowing it **silently**
+is what costs time, because a feature that quietly does nothing looks exactly like
+one that was never wired up.
+
+The rules used here:
+
+- **`NS.warn(where, err)`** (`log.js`) for anything caught and carried on from.
+  Deduplicated by site and message, so a hook running hundreds of times a second
+  still speaks once. The MAIN-world injectors keep a local copy, since they can't
+  reach `NS`.
+- **Accumulate, then report** where several attempts are normal. `fetchRange`
+  tries a path-form range, then a `Range` header, then the service worker, and
+  raises one error naming all three reasons rather than three warnings.
+- **A bare `.catch(() => {})` needs a comment saying why.** Four remain, all
+  genuine: two audio-context teardowns, one suspend after the clip is already
+  cut, and one `play()` rejected by autoplay policy after a seek that landed.
 
 ## The adapter contract
 
@@ -154,7 +187,6 @@ Everything below is read off `NS.adapter` by `core.js`.
 |---|---|
 | `setupAudio(capture)` | Can hand us a tappable media element. Absent on DRM sites, where there is nothing to tap |
 | `audioSegments(start, end)` | Can fetch and decode audio directly. Returns `{buffer, t0, fallbackBuffer?, playbackOnly?, mime?, describe?}`. **Enables the fetch route** |
-| `audioSource()` / `audioBytes()` | An audio-only stream URL / its bytes, for the hidden-player extractor (YouTube) |
 | `syncable` | `true` = the timeline drifts (ads) and needs caption-anchored correction |
 | `playerRoot()` | The player container: narrowed by push mode, and scanned for the caption overlay |
 | `currentTitle()` | Freshest title, asked for at download time |
@@ -163,16 +195,17 @@ Everything below is read off `NS.adapter` by `core.js`.
 
 ### As implemented
 
+[YLR] youtube adapter ready
+[YLR] netflix adapter ready
+[YLR] prime adapter ready
 | member | kind | youtube | netflix | prime |
 |---|---|---|---|---|
-| `audioBytes` | fn | yes | — | — |
 | `audioSegments` | fn | yes | yes | — |
-| `audioSource` | fn | yes | — | — |
 | `clipUrl` | fn | yes | yes | yes |
 | `currentMediaId` | fn | yes | yes | yes |
 | `currentTitle` | fn | — | yes | — |
 | `defaultTrack` | fn | yes | yes | yes |
-| `directAudioStatus` | fn | — | yes | — |
+| `directAudioStatus` | fn | — | yes | yes |
 | `getVideo` | fn | yes | yes | yes |
 | `init` | fn | yes | yes | yes |
 | `isWatchPage` | fn | yes | yes | yes |

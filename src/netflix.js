@@ -13,6 +13,7 @@
   let probe = { probed: false, ok: false, reason: "" };
   let chosen = null; // { stream, index, config } — the stream we can actually decode
   let audioTrackId = ""; // the dub the player says it is playing
+  let lastTitleSources = null;
 
   function getVideo() {
     return document.querySelector("video");
@@ -43,7 +44,8 @@
   // player UI paints, hence the retries.
   function domTitle() {
     const box = document.querySelector(
-      '[data-uia="video-title"], .video-title, .watch-video--title-bar, [class*="title-card-title"]'
+      '[data-uia="video-title"], .video-title, .watch-video--title-bar, ' +
+        '[data-uia="player-title"], [class*="videoTitle"], [class*="title-card-title"]'
     );
     if (!box) return "";
     const head = box.querySelector("h4");
@@ -71,13 +73,23 @@
     );
   }
 
+  const JUNK_TITLE = /^(netflix|home|browse|my list|watch|new & popular|)$/i;
+
+  function usable(title) {
+    const t = String(title || "").replace(/ - Netflix$/, "").trim();
+    return JUNK_TITLE.test(t) ? "" : t;
+  }
+
+  // Best available, and "" rather than a placeholder when there is nothing —
+  // core keeps the last good title instead of overwriting it with page chrome.
   function bestTitle(fromInjector) {
-    const given = withSeason(normalizeEpisode((fromInjector || "").trim()));
+    const given = usable(withSeason(normalizeEpisode(String(fromInjector || "").trim())));
     if (EPISODE_MARK.test(given)) return given;
-    const dom = domTitle();
-    if (dom && EPISODE_MARK.test(dom)) return dom;
-    if (given && given !== "Netflix") return given;
-    return dom || given || document.title;
+    const dom = usable(domTitle());
+    if (EPISODE_MARK.test(dom)) return dom;
+    // Neither names an episode; prefer whichever says more.
+    if (given && dom) return dom.length > given.length ? dom : given;
+    return given || dom;
   }
 
   function announceTracks(payload, attempt) {
@@ -100,6 +112,7 @@
     if (ev.source !== window || ev.data?.source !== "YLR") return;
     if (ev.data.type === "NF_TRACKS") {
       tracks = ev.data.tracks || [];
+      if (ev.data.titleSources) lastTitleSources = ev.data.titleSources;
       if (ev.data.mediaId !== mediaId) {
         indexCache.clear();
         chosen = null;
@@ -128,11 +141,14 @@
     if (!en) return;
     try {
       const res = await fetch(en.url);
-      if (!res.ok) return;
+      if (!res.ok) throw new Error("HTTP " + res.status);
       const body = await res.text();
       const cues = en.format === "ttml" ? NS.parseTTML(body) : NS.parseWebVTT(body);
+      if (!cues.length) throw new Error("parsed to zero cues");
       handlers.onTranslation({ mediaId, lang: sourceTrack.languageCode, cues });
-    } catch (e) {}
+    } catch (e) {
+      NS.warn("netflix: no translation track — hover will show nothing", e);
+    }
   }
 
   // ---- direct audio fetch ----
@@ -262,19 +278,29 @@
   // Netflix's OCA URLs carry the byte range in the path; other deliveries want a
   // Range header. Try both, then hand it to the service worker, which isn't
   // bound by the page's CORS rules.
+  // Three ways in, tried in order. The first two failing is normal — which
+  // delivery a URL wants isn't knowable up front — so they stay quiet, but each
+  // reason is kept and reported if all three fail.
   async function fetchRange(url, from, to) {
+    const tried = [];
     const path = url.replace(/\/range\/\d+-\d+/, "/range/" + from + "-" + to);
     if (path !== url) {
       try {
         const res = await fetch(path);
         if (res.ok) return await res.arrayBuffer();
-      } catch (e) {}
+        tried.push("path form: HTTP " + res.status);
+      } catch (e) {
+        tried.push("path form: " + e.message);
+      }
     }
     try {
       const res = await fetch(url, { headers: { Range: "bytes=" + from + "-" + to } });
       // A 200 here means the range was ignored and the whole file is coming.
       if (res.status === 206) return await res.arrayBuffer();
-    } catch (e) {}
+      tried.push("Range header: HTTP " + res.status + (res.status === 200 ? " (range ignored)" : ""));
+    } catch (e) {
+      tried.push("Range header: " + e.message);
+    }
     const reply = await chrome.runtime.sendMessage({
       type: "YLR_FETCH_BYTES",
       url,
@@ -282,8 +308,9 @@
       to
     });
     if (reply && reply.ok) return base64ToBuffer(reply.body);
+    tried.push("service worker: " + ((reply && reply.error) || "no response"));
     throw new Error(
-      "could not fetch audio bytes " + from + "-" + to + ": " + ((reply && reply.error) || "no response")
+      "could not fetch audio bytes " + from + "-" + to + " — " + tried.join("; ")
     );
   }
 
@@ -437,8 +464,11 @@
     trackLabel(t) {
       return t.name + (t.isForced ? " (forced)" : "");
     },
-    clipUrl() {
-      return "https://www.netflix.com/watch/" + (idFromUrl() || "");
+    // ?t= is a start offset in seconds, so a saved clip's link reopens the
+    // title on the line it came from.
+    clipUrl(range) {
+      const at = range && range.start != null ? Math.max(0, Math.floor(range.start)) : 0;
+      return "https://www.netflix.com/watch/" + (idFromUrl() || "") + "?t=" + at;
     },
     onNavigate(cb) {
       patchHistory(cb);
@@ -460,6 +490,11 @@
     directAudioStatus() {
       return probe;
     },
+    // Every candidate for the title, so a blank one can be diagnosed from the
+    // sidebar rather than by guessing at which source failed.
+    titleSources() {
+      return Object.assign({ titleBar: domTitle() }, lastTitleSources);
+    },
     async loadTrack(track) {
       selectedLang = track.languageCode || "";
       probeAudio();
@@ -475,4 +510,5 @@
 
 
   };
+  console.log("[YLR] netflix adapter ready");
 })();

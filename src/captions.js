@@ -205,11 +205,43 @@
     let ps = doc.getElementsByTagNameNS("*", "p");
     if (!ps.length) ps = doc.getElementsByTagName("p");
 
+    // TTML lets a <p> inherit its timing: `begin` may sit on an ancestor <div>
+    // and be relative to it, and the end may be given as `dur` instead of
+    // `end`. A file that uses either would lose those lines entirely, so walk
+    // up for what the <p> doesn't carry itself.
+    const timingOf = (node) => {
+      let offset = 0;
+      let start = null;
+      let end = null;
+      let dur = null;
+      for (let el = node; el && el.nodeType === 1; el = el.parentNode) {
+        const b = ttmlTime(el.getAttribute("begin"), tickRate);
+        const e = ttmlTime(el.getAttribute("end"), tickRate);
+        const d = ttmlTime(el.getAttribute("dur"), tickRate);
+        if (start == null && b != null) start = b;
+        else if (b != null) offset += b; // an ancestor's begin shifts everything under it
+        if (end == null && e != null) end = e;
+        if (dur == null && d != null) dur = d;
+        if (el.localName === "tt") break;
+      }
+      if (start == null) return null;
+      start += offset;
+      if (end == null) end = dur == null ? null : start + dur;
+      else end += offset;
+      return end == null ? null : { start, end };
+    };
+
     const cues = [];
+    let untimed = 0;
+    let untimedSample = "";
     for (const p of ps) {
-      const start = ttmlTime(p.getAttribute("begin"), tickRate);
-      const end = ttmlTime(p.getAttribute("end"), tickRate);
-      if (start == null || end == null) continue;
+      const timing = timingOf(p);
+      if (!timing) {
+        untimed++;
+        if (!untimedSample) untimedSample = (p.textContent || "").trim().slice(0, 60);
+        continue;
+      }
+      const { start, end } = timing;
       let out = "";
       const walk = (node) => {
         for (const child of node.childNodes) {
@@ -224,6 +256,13 @@
       out = out.replace(/\s+/g, " ").trim();
       if (out) cues.push({ start, end, text: out });
     }
+    // A line that is in the file but not in the sidebar looks like a missing
+    // track, so say when some were thrown away.
+    if (untimed)
+      console.log(
+        "[YLR] TTML: dropped " + untimed + " untimed line(s) of " + ps.length +
+          (untimedSample ? " — e.g. " + JSON.stringify(untimedSample) : "")
+      );
     return cues;
   }
 

@@ -5,7 +5,20 @@
 (function () {
   // Bump with every change to this file: the boot line is how we tell whether a
   // tab is running current code or a stale injection from before a reload.
-  console.log("[YLR] netflix-inject loaded — build 15");
+  console.log("[YLR] netflix-inject loaded 0.4.1");
+
+  // The isolated world's NS.warn isn't reachable from here, so a local copy.
+  // These hooks sit on the page's own fetch/XHR/JSON.parse and must never throw
+  // into the page — but a hook that fails invisibly is indistinguishable from
+  // one that was never installed.
+  const warned = new Set();
+  function warn(where, err) {
+    const message = (err && err.message) || String(err == null ? "" : err);
+    if (warned.has(where + message)) return;
+    warned.add(where + message);
+    console.log("[YLR] " + where + (message ? " — " + message : ""));
+  }
+
   const origParse = JSON.parse;
   const originalFetch = window.fetch;
   // Netflix prefetches the NEXT episode's manifest a few minutes before the
@@ -248,8 +261,82 @@
     return show;
   }
 
+  // "Netflix", "Home", "Browse" are the page chrome, not the thing being watched.
+  // Recording one is worse than recording nothing: it looks like a real answer
+  // and stops anything else being tried.
+  const JUNK_TITLE = /^(netflix|home|browse|my list|watch|new & popular|)$/i;
+
+  function usable(title) {
+    const t = String(title || "").replace(/ - Netflix$/, "").trim();
+    return JUNK_TITLE.test(t) ? "" : t;
+  }
+
+  // Falcor values are wrapped: { $type: "atom", value: … }, and references are
+  // { $type: "ref", value: ["videos", "80107025"] }.
+  function unwrap(v) {
+    return v && typeof v === "object" && "value" in v ? v.value : v;
+  }
+
+  function refId(ref) {
+    const v = ref && ref.value;
+    return Array.isArray(v) ? String(v[v.length - 1]) : "";
+  }
+
+  function numberish(v) {
+    const n = Number(unwrap(v));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // The page keeps a falcor cache of everything it has fetched, keyed by video
+  // id. It is populated long before videoMetadata is, and survives when that
+  // never fills in at all.
+  let falcorLogged = false;
+  function titleFromFalcor(movieId) {
+    try {
+      const videos = window.netflix && window.netflix.falcorCache && window.netflix.falcorCache.videos;
+      const node = videos && videos[String(movieId)];
+      if (!node) return "";
+      if (!falcorLogged) {
+        falcorLogged = true;
+        console.log("[YLR] falcor entry for", movieId, "keys:", Object.keys(node).join(","));
+      }
+      const own = usable(unwrap(node.title));
+      const season = numberish(node.seasonSequence !== undefined ? node.seasonSequence : node.seq);
+      const episode = numberish(node.episodeSequence);
+      const showKey = refId(node.parentShow || node.ancestor || node.topLevel || node.parent);
+      const show = showKey && videos[showKey] ? usable(unwrap(videos[showKey].title)) : "";
+
+      const parts = [];
+      if (show) parts.push(show);
+      if (episode != null)
+        parts.push((season != null ? "S" + pad(season) : "") + "E" + pad(episode));
+      if (own && own !== show) parts.push(own);
+      return parts.join(" - ") || own;
+    } catch (e) {
+      warn("netflix: falcor cache unreadable", e);
+      return "";
+    }
+  }
+
+  // What each source says right now — reported to the sidebar so it can be read
+  // without the console, which is one filter setting away from hiding all of it.
+  function titleSources(movieId) {
+    return {
+      videoMetadata: usable(titleFromMetadata(movieId)),
+      falcorCache: titleFromFalcor(movieId),
+      documentTitle: String(document.title || ""),
+      movieId: String(movieId || "")
+    };
+  }
+
+  // Every source, best first. Returns "" rather than a placeholder, so the
+  // adapter's DOM fallback and the retries still get their turn.
   function bestTitle(movieId) {
-    return titleFromMetadata(movieId) || document.title.replace(/ - Netflix$/, "").trim();
+    return (
+      usable(titleFromMetadata(movieId)) ||
+      titleFromFalcor(movieId) ||
+      usable(document.title)
+    );
   }
 
   const HAS_EPISODE = /\bS\d+\s*[:x·-]?\s*E\d+\b/i;
@@ -334,7 +421,15 @@
     const audioTrackId = playingAudioTrackId() || currentAudioTrackId;
     if (audioTrackId) currentAudioTrackId = audioTrackId;
     window.postMessage(
-      Object.assign({ source: "YLR", type: "NF_TRACKS", audioTrackId }, entry),
+      Object.assign(
+        {
+          source: "YLR",
+          type: "NF_TRACKS",
+          audioTrackId,
+          titleSources: titleSources(entry.mediaId)
+        },
+        entry
+      ),
       "*"
     );
   }
@@ -395,7 +490,9 @@
       // manifest-shaped. Scan them (that's how we learn what's playing) but stay
       // quiet — scanDeep speaks up when it actually finds something.
       if (looksLikeManifest(text)) scanDeep(data, 0);
-    } catch (e) {}
+    } catch (e) {
+      warn("netflix: JSON.parse hook failed", e);
+    }
     return data;
   };
 
@@ -406,9 +503,15 @@
     try {
       const url = typeof args[0] === "string" ? args[0] : args[0]?.url;
       if (url && /manifest|licensedManifest|\/msl|cadmium|playapi|pathEvaluator|\/nq\//i.test(url)) {
-        res.clone().text().then(scanText).catch(() => {});
+        res
+          .clone()
+          .text()
+          .then(scanText)
+          .catch((e) => warn("netflix: could not read a manifest response", e));
       }
-    } catch (e) {}
+    } catch (e) {
+      warn("netflix: fetch hook failed", e);
+    }
     return res;
   };
 
@@ -424,7 +527,9 @@
         if (this.__ylrUrl && /manifest|licensedManifest|\/msl|cadmium|playapi|pathEvaluator|\/nq\//i.test(String(this.__ylrUrl))) {
           scanText(this.responseText);
         }
-      } catch (e) {}
+      } catch (e) {
+        warn("netflix: XHR hook failed", e);
+      }
     });
     return xhrSend.apply(this, arguments);
   };
@@ -437,6 +542,9 @@
       const player = api.getVideoPlayerBySessionId(sid);
       const before = player.getCurrentTime ? player.getCurrentTime() : "n/a";
       player.seek(Math.floor(seconds * 1000));
+      // seek() moves the playhead but leaves a paused player paused, and the ▶
+      // on a subtitle line means "play from here".
+      if (player.play) player.play();
       console.log(
         "[YLR] NF_SEEK target",
         Math.floor(seconds * 1000),

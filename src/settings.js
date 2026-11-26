@@ -4,7 +4,14 @@
 (function () {
   const NS = (window.YLR = window.YLR || {});
   const KEY = "ylr-settings";
-  const DEFAULTS = { wordHighlight: false, pushPage: true, hidePlayerCaptions: true };
+  const DEFAULTS = {
+    wordHighlight: false,
+    pushPage: true,
+    hidePlayerCaptions: true,
+    deleteOnExport: false,
+    clipLead: 0.8,
+    clipTail: 0.65
+  };
 
   let cache = Object.assign({}, DEFAULTS);
   const listeners = [];
@@ -29,7 +36,9 @@
       cache = Object.assign({}, DEFAULTS, changes[KEY].newValue || {});
       for (const fn of listeners) fn(cache);
     });
-  } catch (e) {}
+  } catch (e) {
+    NS.warn("settings: cross-tab sync unavailable", e);
+  }
 
   NS.settings = {
     ready,

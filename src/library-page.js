@@ -65,7 +65,9 @@
     let host = tab.url;
     try {
       host = new URL(tab.url).hostname;
-    } catch (e) {}
+    } catch (e) {
+      // Cosmetic only — the full URL is a fine label if it won't parse.
+    }
     while (total === null || from < total) {
       const res = await pull(tab.id, from);
       total = res.total;

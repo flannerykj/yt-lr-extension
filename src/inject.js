@@ -16,7 +16,9 @@
       if (u.searchParams.get("v")) return u.searchParams.get("v");
       const m = location.pathname.match(/\/(shorts|embed)\/([^/?#]+)/);
       if (m) return m[2];
-    } catch (e) {}
+    } catch (e) {
+      warn("youtube: could not read the video id from the URL", e);
+    }
     return null;
   }
 
@@ -30,7 +32,9 @@
     if (!mp) return null;
     try {
       mp.loadModule("captions");
-    } catch (e) {}
+    } catch (e) {
+      warn("youtube: player would not load the captions module", e);
+    }
     try {
       return (
         mp.getOption("captions", "tracklist", { includeAsr: true }) ||
@@ -85,6 +89,19 @@
         fetchTranslation(lang, videoId, url);
       } else {
         console.log("[YLR] response was not json3 (status " + status + "):", text.slice(0, 120));
+
+  // The isolated world's NS.warn isn't reachable from here, so a local copy.
+  // These hooks sit on the page's own fetch/XHR/JSON.parse and must never throw
+  // into the page — but a hook that fails invisibly is indistinguishable from
+  // one that was never installed.
+  const warned = new Set();
+  function warn(where, err) {
+    const message = (err && err.message) || String(err == null ? "" : err);
+    if (warned.has(where + message)) return;
+    warned.add(where + message);
+    console.log("[YLR] " + where + (message ? " — " + message : ""));
+  }
+
       }
     } catch (e) {
       console.log("[YLR] deliver failed:", e);
@@ -145,7 +162,9 @@
     try {
       const b = sb.buffered;
       for (let i = 0; i < b.length; i++) out.push([b.start(i), b.end(i)]);
-    } catch (e) {}
+    } catch (e) {
+      warn("youtube: could not read the buffered ranges", e);
+    }
     return out;
   }
 
@@ -319,108 +338,7 @@
 
   // ---- audio-only stream, for extracting clips the ring buffer never heard ----
 
-  let mediaUrl = null; // { url, mime, videoId, from }
 
-  // The player's own DASH requests carry fully signed, un-throttled URLs, so a
-  // captured one is the best source. Range/segment params are stripped so the
-  // URL serves the whole track; ump/sabr would wrap the bytes in a container
-  // protocol an <audio> element can't read.
-  function noteMediaUrl(rawUrl) {
-    if (!rawUrl || String(rawUrl).indexOf("videoplayback") === -1) return;
-    const vid = currentVideoId();
-    if (mediaUrl && mediaUrl.videoId === vid) return;
-    let u;
-    try {
-      u = new URL(rawUrl, location.origin);
-    } catch (e) {
-      return;
-    }
-    const mime = decodeURIComponent(u.searchParams.get("mime") || "");
-    if (!mime.startsWith("audio")) return;
-    for (const p of ["range", "rn", "rbuf", "ump", "sabr", "alr", "srfvp"])
-      u.searchParams.delete(p);
-    mediaUrl = { url: u.toString(), mime, videoId: vid, from: "player request" };
-    console.log("[YLR] captured audio stream:", mime, "itag", u.searchParams.get("itag"));
-  }
-
-  // Fallback: the player response lists adaptive formats. Only usable when the
-  // entry has a plain `url` (a `signatureCipher` needs the player JS to solve).
-  function mediaUrlFromPlayerResponse() {
-    const mp = player();
-    let resp = null;
-    try {
-      resp = mp && mp.getPlayerResponse ? mp.getPlayerResponse() : null;
-    } catch (e) {}
-    const formats = (resp && resp.streamingData && resp.streamingData.adaptiveFormats) || [];
-    const audio = formats
-      .filter((f) => (f.mimeType || "").startsWith("audio/") && f.url)
-      .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0));
-    if (!audio.length) return null;
-    console.log("[YLR] audio stream from player response: itag", audio[0].itag);
-    return {
-      url: audio[0].url,
-      mime: audio[0].mimeType,
-      videoId: currentVideoId(),
-      from: "player response"
-    };
-  }
-
-  function currentMediaUrl() {
-    const vid = currentVideoId();
-    if (mediaUrl && mediaUrl.videoId === vid) return mediaUrl;
-    return mediaUrlFromPlayerResponse();
-  }
-
-  function sendAudioSource() {
-    const src = currentMediaUrl();
-    if (!src) console.log("[YLR] no audio-only stream URL available yet");
-    window.postMessage(
-      {
-        source: "YLR",
-        type: "AUDIO_SOURCE",
-        ok: !!src,
-        url: src ? src.url : null,
-        mime: src ? src.mime : null,
-        from: src ? src.from : null,
-        videoId: currentVideoId(),
-        reason: src ? null : "no audio-only stream URL available for this video"
-      },
-      "*"
-    );
-  }
-
-  // Same-origin-privileged fetch of the whole track, for when the <audio>
-  // element can't load the URL itself (CORS). Bytes are transferred, not copied.
-  async function sendAudioBytes() {
-    const src = currentMediaUrl();
-    const fail = (reason) =>
-      window.postMessage(
-        { source: "YLR", type: "AUDIO_BYTES", ok: false, reason, videoId: currentVideoId() },
-        "*"
-      );
-    if (!src) return fail("no audio-only stream URL available for this video");
-    try {
-      // No credentials: googlevideo allows the origin but not credentialed CORS.
-      const res = await originalFetch(src.url, { credentials: "omit" });
-      if (!res.ok) return fail("audio stream fetch returned HTTP " + res.status);
-      const buf = await res.arrayBuffer();
-      console.log("[YLR] fetched audio track:", (buf.byteLength / 1048576).toFixed(1), "MB");
-      window.postMessage(
-        {
-          source: "YLR",
-          type: "AUDIO_BYTES",
-          ok: true,
-          mime: src.mime,
-          buffer: buf,
-          videoId: currentVideoId()
-        },
-        "*",
-        [buf]
-      );
-    } catch (e) {
-      fail("audio stream fetch failed: " + e.message);
-    }
-  }
 
   function handleTimedText(rawUrl, bodyMaybe) {
     let u;
@@ -444,10 +362,15 @@
     try {
       const url = typeof args[0] === "string" ? args[0] : args[0]?.url;
       if (url && url.includes("/api/timedtext")) {
-        response.clone().text().then((t) => handleTimedText(url, t)).catch(() => {});
+        response
+          .clone()
+          .text()
+          .then((t) => handleTimedText(url, t))
+          .catch((e) => warn("youtube: could not read a timedtext response", e));
       }
-      noteMediaUrl(url);
-    } catch (e) {}
+    } catch (e) {
+      warn("youtube: fetch hook failed", e);
+    }
     return response;
   };
 
@@ -455,7 +378,6 @@
   const xhrSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (method, url) {
     this.__ylrUrl = url;
-    noteMediaUrl(url);
     return xhrOpen.apply(this, arguments);
   };
   XMLHttpRequest.prototype.send = function () {
@@ -464,7 +386,9 @@
         if (this.__ylrUrl && String(this.__ylrUrl).includes("/api/timedtext")) {
           handleTimedText(this.__ylrUrl, this.responseText);
         }
-      } catch (e) {}
+      } catch (e) {
+        warn("youtube: XHR hook failed", e);
+      }
     });
     return xhrSend.apply(this, arguments);
   };
@@ -507,10 +431,6 @@
       pushTracks();
     } else if (d.type === "REQUEST_AUDIO_SEGMENTS") {
       sendAudioSegments(d.start, d.end);
-    } else if (d.type === "REQUEST_AUDIO_SOURCE") {
-      sendAudioSource();
-    } else if (d.type === "REQUEST_AUDIO_BYTES") {
-      sendAudioBytes();
     } else if (d.type === "SELECT_TRACK") {
       const { languageCode, kind } = d;
       console.log("[YLR] SELECT_TRACK requested:", languageCode, kind);
@@ -556,7 +476,6 @@
   pollTracks();
   document.addEventListener("yt-navigate-finish", () => {
     capturedUrls.clear();
-    mediaUrl = null;
     // Only drop captured audio if this really is a different video — the event
     // also fires for the page we are already on.
     if (audioStore.videoId && audioStore.videoId !== currentVideoId()) resetAudioStore();

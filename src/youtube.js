@@ -19,7 +19,9 @@
       if (u.searchParams.get("v")) return u.searchParams.get("v");
       const m = location.pathname.match(/\/(shorts|embed)\/([^/?#]+)/);
       if (m) return m[2];
-    } catch (e) {}
+    } catch (e) {
+      NS.warn("youtube: could not read the video id from the URL", e, location.href);
+    }
     return null;
   }
 
@@ -69,12 +71,10 @@
           lang: d.lang,
           cues: NS.parseJson3Cues(d.text)
         });
-      } catch (e) {}
-    } else if (
-      d.type === "AUDIO_SOURCE" ||
-      d.type === "AUDIO_BYTES" ||
-      d.type === "AUDIO_SEGMENTS"
-    ) {
+      } catch (e) {
+        NS.warn("youtube: translation track failed to parse", e);
+      }
+    } else if (d.type === "AUDIO_SEGMENTS") {
       const p = pendingAudio.get(d.type);
       if (p) {
         pendingAudio.delete(d.type);
@@ -117,7 +117,7 @@
       const v = getVideo();
       if (!v) return;
       v.currentTime = seconds;
-      v.play().catch(() => {});
+      v.play().catch(() => {}); // autoplay policy; the seek still landed
     },
     defaultTrack(tracks) {
       return tracks.find((t) => t.kind === "asr") || tracks[0];
@@ -152,12 +152,7 @@
     },
     audioSegments(start, end) {
       return askPage("REQUEST_AUDIO_SEGMENTS", "AUDIO_SEGMENTS", 8000, { start, end });
-    },
-    audioSource() {
-      return askPage("REQUEST_AUDIO_SOURCE", "AUDIO_SOURCE", 8000);
-    },
-    audioBytes() {
-      return askPage("REQUEST_AUDIO_BYTES", "AUDIO_BYTES", 120000);
     }
   };
+  console.log("[YLR] youtube adapter ready");
 })();
