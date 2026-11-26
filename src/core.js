@@ -1189,13 +1189,55 @@
     ];
   }
 
+  const PARAGRAPH_PAUSE_SECONDS = 2;
+  const PARAGRAPH_MAX_CHARS = 500;
+  const SENTENCE_END = /[.!?…。！？]["'”’»」』)]*$/;
+  const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+  function joinCueText(paragraph, next) {
+    if (!paragraph) return next;
+    if (!next) return paragraph;
+    const lastChar = paragraph.slice(-1);
+    const firstChar = next.charAt(0);
+    const noSpace = CJK_CHAR.test(lastChar) || CJK_CHAR.test(firstChar);
+    const separator = noSpace ? "" : " ";
+    return paragraph + separator + next;
+  }
+
   function buildTxt(rows) {
     const out = transcriptHeader().map((l) => "# " + l);
     out.push("");
+
+    const paragraphs = [];
+    let text = "";
+    let translation = "";
+    let previousEnd = null;
+
     for (const r of rows) {
-      out.push("[" + stamp(r.start, ".") + " --> " + stamp(r.end, ".") + "]");
-      out.push(r.text);
-      if (r.translation) out.push(r.translation);
+      const cueText = String(r.text || "").replace(/\s+/g, " ").trim();
+      const cueTranslation = String(r.translation || "").replace(/\s+/g, " ").trim();
+
+      if (text) {
+        const pause = previousEnd === null ? 0 : r.start - previousEnd;
+        const atSentenceEnd = SENTENCE_END.test(text);
+        const longPause = pause >= PARAGRAPH_PAUSE_SECONDS;
+        const tooLong = text.length >= PARAGRAPH_MAX_CHARS;
+        if (atSentenceEnd && (longPause || tooLong)) {
+          paragraphs.push({ text, translation });
+          text = "";
+          translation = "";
+        }
+      }
+
+      text = joinCueText(text, cueText);
+      translation = joinCueText(translation, cueTranslation);
+      previousEnd = r.end;
+    }
+    if (text) paragraphs.push({ text, translation });
+
+    for (const p of paragraphs) {
+      out.push(p.text);
+      if (p.translation) out.push(p.translation);
       out.push("");
     }
     return out.join("\n");
